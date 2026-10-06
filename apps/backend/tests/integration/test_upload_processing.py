@@ -235,12 +235,14 @@ async def test_upload_accepts_valid_pdf_container(
 async def test_upload_rejects_valid_pdf_without_extractable_text(
     client: AsyncClient, isolated_db: Database, sample_resume: dict[str, object]
 ) -> None:
-    """A valid but blank/scanned-style PDF remains an intentional 422 control."""
+    """A valid but blank/scanned-style PDF remains an intentional 422 control when OCR yields nothing."""
     with patch(
         "app.routers.resumes.parse_resume_to_json",
         new_callable=AsyncMock,
         return_value=sample_resume,
-    ) as parse_json:
+    ) as parse_json, patch(
+        "app.routers.resumes.ocr_pdf", new_callable=AsyncMock, return_value=""
+    ):
         async with client:
             response = await client.post(
                 "/api/v1/resumes/upload",
@@ -255,6 +257,50 @@ async def test_upload_rejects_valid_pdf_without_extractable_text(
     )
     parse_json.assert_not_awaited()
     assert await isolated_db.list_resumes() == []
+
+
+async def test_upload_scanned_pdf_is_transcribed_by_ocr(
+    client: AsyncClient, isolated_db: Database, sample_resume: dict[str, object]
+) -> None:
+    """A scan has no text layer: the OCR transcription replaces it and parsing continues."""
+    transcription = "Jane Doe " + "Senior engineer at Acme building payment systems. " * 10
+    with patch(
+        "app.routers.resumes.parse_resume_to_json",
+        new_callable=AsyncMock,
+        return_value=sample_resume,
+    ) as parse_json, patch(
+        "app.routers.resumes.ocr_pdf", new_callable=AsyncMock, return_value=transcription
+    ) as ocr:
+        async with client:
+            response = await client.post(
+                "/api/v1/resumes/upload",
+                files={"file": ("scanned.pdf", _pdf_bytes(), "application/pdf")},
+            )
+
+    assert response.status_code == 200
+    ocr.assert_awaited_once()
+    parse_json.assert_awaited_once()
+    assert parse_json.await_args.args[0] == transcription
+    assert len(await isolated_db.list_resumes()) == 1
+
+
+async def test_upload_text_pdf_never_calls_ocr(
+    client: AsyncClient, isolated_db: Database, sample_resume: dict[str, object]
+) -> None:
+    text = "Jane Doe Senior engineer at Acme building payment systems " * 8
+    with patch(
+        "app.routers.resumes.parse_resume_to_json",
+        new_callable=AsyncMock,
+        return_value=sample_resume,
+    ), patch("app.routers.resumes.ocr_pdf", new_callable=AsyncMock) as ocr:
+        async with client:
+            response = await client.post(
+                "/api/v1/resumes/upload",
+                files={"file": ("resume.pdf", _pdf_bytes(text), "application/pdf")},
+            )
+
+    assert response.status_code == 200
+    ocr.assert_not_awaited()
 
 
 async def test_upload_rejects_extracted_text_over_prompt_limit(
