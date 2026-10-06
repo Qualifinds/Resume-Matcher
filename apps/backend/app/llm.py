@@ -1034,6 +1034,59 @@ async def complete(
         ) from e
 
 
+def supports_vision(config: LLMConfig | None = None) -> bool:
+    """Whether the configured model accepts images (LiteLLM registry; Ollama is assumed capable)."""
+    config = config or get_llm_config()
+    model_name = get_model_name(config)
+    if model_name.startswith(("ollama/", "ollama_chat/")):
+        return True
+    try:
+        return bool(litellm.supports_vision(model=model_name))
+    except Exception:
+        return False
+
+
+async def complete_vision(
+    prompt: str,
+    images: list[bytes],
+    system_prompt: str | None = None,
+    config: LLMConfig | None = None,
+    max_tokens: int = 8192,
+) -> str:
+    """Completion with PNG images attached (OCR). Same router, timeout budget and error policy as `complete`."""
+    import base64
+
+    router, config = get_router(config)
+    model_name = get_model_name(config)
+
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for png in images:
+        encoded = base64.b64encode(png).decode("ascii")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": parts})
+
+    try:
+        response = await router.acompletion(
+            model="primary",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0,
+            timeout=remaining_timeout(_calculate_timeout("completion", max_tokens, config.provider)),
+        )
+        content = _extract_choice_text(response.choices[0])
+        if not content or not content.strip():
+            raise ValueError("Empty response from LLM")
+        return content.strip()
+    except TimeoutError:
+        raise
+    except Exception as e:
+        logging.error(f"LLM vision completion failed: {e}", extra={"model": model_name})
+        raise ValueError("LLM vision completion failed.") from e
+
+
 def _supports_json_mode(model_name: str) -> bool:
     """Check if the model supports JSON mode via LiteLLM's model registry.
 

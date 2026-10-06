@@ -89,6 +89,7 @@ from app.services.improver import (
     verify_skill_target_plan,
 )
 from app.services.interview_prep import generate_interview_prep
+from app.services.ocr import needs_ocr, ocr_pdf
 from app.services.page_fit import render_drafts
 from app.services.parser import (
     MAX_EXTRACTED_TEXT_BYTES,
@@ -987,6 +988,12 @@ async def upload_resume(
             status_code=422,
             detail="Failed to parse document. Please upload a valid PDF, DOC, or DOCX file.",
         )
+
+    # Scanned PDF (empty or junk text layer): transcribe the page images; if that fails the 422 below stands.
+    if (file.filename or "").lower().endswith(".pdf") and needs_ocr(markdown_content):
+        ocr_text = await ocr_pdf(content)
+        if ocr_text and not needs_ocr(ocr_text):
+            markdown_content = ocr_text
 
     # Validate extracted text is not empty (image-based PDFs / scanned documents)
     if not markdown_content or not markdown_content.strip():
