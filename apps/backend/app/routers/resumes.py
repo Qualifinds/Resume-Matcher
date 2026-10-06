@@ -1603,6 +1603,7 @@ async def download_resume_pdf(
     showContactIcons: bool = Query(False),
     accentColor: str = Query("blue", pattern="^(blue|green|orange|red)$"),
     lang: str | None = Query(None, pattern="^[a-z]{2}(-[A-Z]{2})?$"),
+    variant: str = Query("standard", pattern="^(standard|client)$"),
 ) -> Response:
     """Generate a PDF for a resume using headless Chromium.
 
@@ -1620,6 +1621,8 @@ async def download_resume_pdf(
     - compactMode: enable tighter spacing
     - showContactIcons: show icons in contact info
     - lang: locale used for print page translations
+    - variant: `standard`, or `client` for the same resume WITHOUT contact info (no email,
+      phone, links or street address; city/country only). Used by Qualifinds for client-facing CVs.
     """
     resume = await db.get_resume(resume_id)
     if not resume:
@@ -1646,6 +1649,8 @@ async def download_resume_pdf(
     )
     if lang:
         params = f"{params}&lang={lang}"
+    if variant == "client":
+        params = f"{params}&variant=client"
     url = f"{settings.frontend_base_url}/print/resumes/{resume_id}?{params}"
 
     # Use the exact margins provided; compact mode only affects spacing.
@@ -1662,7 +1667,8 @@ async def download_resume_pdf(
     except PDFRenderError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    headers = {"Content-Disposition": f'attachment; filename="resume_{resume_id}.pdf"'}
+    suffix = "_client" if variant == "client" else ""
+    headers = {"Content-Disposition": f'attachment; filename="resume_{resume_id}{suffix}.pdf"'}
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 

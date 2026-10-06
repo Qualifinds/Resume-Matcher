@@ -13,6 +13,7 @@ import { API_BASE } from '@/lib/api/client';
 import { translate } from '@/lib/i18n/server';
 import { resolveLocale } from '@/lib/i18n/locale';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
+import { toClientResume } from '@/lib/client-resume';
 
 type PageProps = {
   params: Promise<{ id: string }>;
@@ -34,6 +35,7 @@ type PageProps = {
     showContactIcons?: string;
     accentColor?: string;
     lang?: string;
+    variant?: string;
   }>;
 };
 
@@ -162,7 +164,11 @@ export default async function PrintResumePage({ params, searchParams }: PageProp
   const locale = resolveLocale(resolvedSearchParams?.lang);
   const t = (key: string, params?: Record<string, string | number>) =>
     translate(locale, key, params);
-  const localizedResumeData = withLocalizedDefaultSections(resumeData, t);
+  // `variant=client`: the same résumé without the candidate's contact info (lib/client-resume.ts).
+  // Applied BEFORE any template renders, so the removed data never reaches the printed HTML.
+  const baseResumeData =
+    resolvedSearchParams?.variant === 'client' ? toClientResume(resumeData) : resumeData;
+  const localizedResumeData = withLocalizedDefaultSections(baseResumeData, t);
   const additionalSectionLabels = {
     technicalSkills: t('resume.additionalLabels.technicalSkills'),
     languages: t('resume.additionalLabels.languages'),
