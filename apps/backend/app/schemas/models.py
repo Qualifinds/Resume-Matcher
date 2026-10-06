@@ -7,6 +7,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.ai_limits import validate_source_size
+from app.schemas.refinement import RefinementStats
+
 _TEXT_VALUE_KEYS = (
     "text",
     "summary",
@@ -432,6 +435,7 @@ class ResumeUploadResponse(BaseModel):
     resume_id: str
     processing_status: Literal["pending", "processing", "ready", "failed"] = "pending"
     is_master: bool = False
+    is_default_master: bool = False
 
 
 class RawResume(BaseModel):
@@ -481,6 +485,8 @@ class ResumeFetchData(BaseModel):
     interview_prep: InterviewPrepData | None = None
     parent_id: str | None = None  # For determining if resume is tailored
     title: str | None = None
+    is_master: bool = False
+    is_default_master: bool = False
 
 
 class ResumeFetchResponse(BaseModel):
@@ -496,6 +502,7 @@ class ResumeSummary(BaseModel):
     resume_id: str
     filename: str | None = None
     is_master: bool = False
+    is_default_master: bool = False
     parent_id: str | None = None
     processing_status: str = "pending"
     created_at: str
@@ -508,6 +515,23 @@ class ResumeListResponse(BaseModel):
 
     request_id: str
     data: list[ResumeSummary]
+
+
+class SetDefaultMasterResponse(BaseModel):
+    """Response after switching the default master resume."""
+
+    resume_id: str
+    is_default_master: bool
+
+
+class DuplicateResumeResponse(BaseModel):
+    """Response after duplicating a resume."""
+
+    resume_id: str
+    title: str
+    is_master: bool
+    is_default_master: bool
+    parent_id: str | None = None
 
 
 # Job Description Models
@@ -527,12 +551,66 @@ class JobUploadResponse(BaseModel):
 
 
 # Improvement Models
+class PageFitSettings(BaseModel):
+    """Print settings used to measure page count (mirrors GET /resumes/{id}/pdf)."""
+
+    template: Literal[
+        "swiss-single",
+        "swiss-two-column",
+        "modern",
+        "modern-two-column",
+        "latex",
+        "clean",
+        "vivid",
+    ] = "swiss-single"
+    pageSize: Literal["A4", "LETTER"] = "A4"
+    marginTop: int = Field(10, ge=5, le=25)
+    marginBottom: int = Field(10, ge=5, le=25)
+    marginLeft: int = Field(10, ge=5, le=25)
+    marginRight: int = Field(10, ge=5, le=25)
+    sectionSpacing: int = Field(3, ge=1, le=5)
+    itemSpacing: int = Field(2, ge=1, le=5)
+    lineHeight: int = Field(3, ge=1, le=5)
+    fontSize: int = Field(3, ge=1, le=5)
+    headerScale: int = Field(3, ge=1, le=5)
+    headerFont: Literal["serif", "sans-serif", "mono"] = "serif"
+    bodyFont: Literal["serif", "sans-serif", "mono"] = "sans-serif"
+    compactMode: bool = False
+    showContactIcons: bool = False
+    accentColor: Literal["blue", "green", "orange", "red"] = "blue"
+    lang: str | None = Field(None, pattern=r"^[a-z]{2}(-[A-Z]{2})?$")
+
+    def to_query(self) -> dict[str, str]:
+        query: dict[str, str] = {}
+        for name, value in self.model_dump(exclude_none=True).items():
+            query[name] = str(value).lower() if isinstance(value, bool) else str(value)
+        return query
+
+
 class ImproveResumeRequest(BaseModel):
     """Request to improve/tailor a resume."""
 
     resume_id: str
     job_id: str
     prompt_id: str | None = None
+    max_bullets_per_entry: int | None = Field(None, ge=1, le=10)
+    page_fit: PageFitSettings | None = None
+
+
+class BulletSelectionSummary(BaseModel):
+    """What the harness kept/dropped when tailoring from a long master."""
+
+    max_per_entry: int
+    bullets_before: int
+    bullets_after: int
+    trimmed_for_fit: int = 0
+    scoring: Literal["llm", "keyword_fallback"]
+    page_fit: Literal["fits", "trimmed", "over", "unavailable", "skipped"]
+    final_pages: int | None = None
+    # Re-render of the rewritten result: "ok" = final_pages measures it, "skipped" =
+    # it could not be rendered (final_pages is then the pre-rewrite measurement),
+    # None = no final check applies (page fit skipped, over or unavailable).
+    final_check: Literal["ok", "skipped"] | None = None
 
 
 class ImprovementSuggestion(BaseModel):
@@ -615,34 +693,12 @@ class ATSScore(BaseModel):
     )
 
 
-class RefinementStats(BaseModel):
-    """Statistics from the multi-pass refinement process."""
-
-    passes_completed: int = Field(default=0, ge=0, description="Number of passes run")
-    keywords_injected: int = Field(
-        default=0, ge=0, description="Number of keywords injected"
-    )
-    ai_phrases_removed: list[str] = Field(
-        default_factory=list, description="List of AI phrases that were removed"
-    )
-    alignment_violations_fixed: int = Field(
-        default=0, ge=0, description="Number of alignment violations corrected"
-    )
-    initial_match_percentage: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
-        description="Keyword match before refinement",
-    )
-    final_match_percentage: float = Field(
-        default=0.0, ge=0.0, le=100.0, description="Keyword match after refinement"
-    )
-
-
 class ImproveResumeData(BaseModel):
     """Data payload for improve response."""
 
     request_id: str
+    preview_id: str | None = None
+    preview_expires_at: str | None = None
     resume_id: str | None = Field(
         default=None,
         description="Null for preview responses; populated when the tailored resume is persisted.",
@@ -666,6 +722,9 @@ class ImproveResumeData(BaseModel):
     # ATS score breakdown
     ats_score: "ATSScore | None" = None
 
+    # Harness bullet selection summary (None unless max_bullets_per_entry was requested)
+    bullet_selection: BulletSelectionSummary | None = None
+
     # Warning and status fields for transparency
     warnings: list[str] = Field(default_factory=list)
     refinement_attempted: bool = False
@@ -684,8 +743,17 @@ class ImproveResumeConfirmRequest(BaseModel):
 
     resume_id: str
     job_id: str
+    preview_id: str | None = None
     improved_data: ResumeData
     improvements: list[ImprovementSuggestion]
+
+    @model_validator(mode="after")
+    def _validate_source_budget(self) -> "ImproveResumeConfirmRequest":
+        # A preview-sized resume remains confirmable when suggestions/IDs are
+        # added to its envelope. Each independently bounded source stays capped.
+        validate_source_size(self.improved_data.model_dump(mode="json"))
+        validate_source_size(self.model_dump(mode="json", exclude={"improved_data"}))
+        return self
 
 
 # Config Models

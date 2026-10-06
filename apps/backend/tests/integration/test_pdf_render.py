@@ -32,12 +32,10 @@ from app.pdf import (
     render_resume_pdf,
 )
 
-
 # A self-contained page that satisfies wait_for_selector(".resume-print")
 # without needing the real frontend running.
 RESUME_PRINT_DATA_URL = (
-    "data:text/html,"
-    "<html><body><div class='resume-print'>Hello PDF</div></body></html>"
+    "data:text/html,<html><body><div class='resume-print'>Hello PDF</div></body></html>"
 )
 
 
@@ -127,9 +125,7 @@ class TestResolvePdfMargins:
         }
 
     def test_custom_values_are_formatted_as_mm(self):
-        result = _resolve_pdf_margins(
-            {"top": 20, "right": 15, "bottom": 25, "left": 5}
-        )
+        result = _resolve_pdf_margins({"top": 20, "right": 15, "bottom": 25, "left": 5})
         assert result == {
             "top": "20mm",
             "right": "15mm",
@@ -159,7 +155,9 @@ class TestRenderPageWaitStrategy:
     async def test_goto_uses_load_with_bounded_timeout(self):
         page = AsyncMock()
         page.pdf.return_value = b"%PDF-1.4 fake"
-        await _render_page_to_pdf(page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"})
+        await _render_page_to_pdf(
+            page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"}
+        )
         _, goto_kwargs = page.goto.call_args
         assert goto_kwargs.get("wait_until") == "load"
         # An explicit, positive, bounded navigation timeout (not the fragile default).
@@ -170,17 +168,38 @@ class TestRenderPageWaitStrategy:
         """The real readiness signal — the resume content must be present."""
         page = AsyncMock()
         page.pdf.return_value = b"%PDF-1.4 fake"
-        await _render_page_to_pdf(page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"})
+        await _render_page_to_pdf(
+            page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"}
+        )
         page.wait_for_selector.assert_awaited()
         selector_arg = page.wait_for_selector.call_args.args[0]
         assert selector_arg == ".resume-print"
+
+    async def test_print_error_marker_fails_fast_without_a_pdf(self) -> None:
+        """A print page that reports it could not load its data is not a resume."""
+        page = AsyncMock()
+        marker = AsyncMock()
+        marker.get_attribute.return_value = "draft-unavailable"
+        page.wait_for_selector.return_value = marker
+        with pytest.raises(PDFRenderError):
+            await _render_page_to_pdf(
+                page,
+                "http://f/print/resumes/draft?draft=x",
+                ".resume-print, [data-print-error]",
+                "A4",
+                {"top": "10mm"},
+            )
+        marker.get_attribute.assert_awaited_with("data-print-error")
+        page.pdf.assert_not_awaited()
 
     async def test_still_waits_for_fonts_bounded(self):
         """Fonts must be loaded before snapshot (else text renders unstyled), and
         the wait must be bounded by the nav timeout — not Playwright's default."""
         page = AsyncMock()
         page.pdf.return_value = b"%PDF-1.4 fake"
-        await _render_page_to_pdf(page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"})
+        await _render_page_to_pdf(
+            page, "http://f/print/r", ".resume-print", "A4", {"top": "10mm"}
+        )
         page.wait_for_function.assert_awaited()
         assert "fonts" in page.wait_for_function.call_args.args[0]
         assert page.wait_for_function.call_args.kwargs.get("timeout")
@@ -199,7 +218,10 @@ class TestPlaywrightErrorMapping:
             '  - navigating to "http://localhost:3000/print/resumes/SECRET-RESUME-ID"'
         )
         with pytest.raises(PDFRenderError) as exc_info:
-            _raise_playwright_error(PlaywrightError(raw), "http://localhost:3000/print/resumes/SECRET-RESUME-ID")
+            _raise_playwright_error(
+                PlaywrightError(raw),
+                "http://localhost:3000/print/resumes/SECRET-RESUME-ID",
+            )
         msg = str(exc_info.value)
         assert "Call log" not in msg
         assert "SECRET-RESUME-ID" not in msg
@@ -283,3 +305,21 @@ class TestRenderResumePdfErrors:
         if "executable" in message:
             pytest.skip(f"chromium unavailable: {exc_info.value}")
         assert "cannot connect to frontend" in message
+
+    async def test_print_error_marker_fails_fast_in_a_real_browser(self) -> None:
+        """The draft print page's error marker ends the wait at once (no 60 s timeout).
+
+        Only the marker path raises a plain PDFRenderError; a wait that ignored the
+        marker would hit the render deadline and raise PDFRenderTimeoutError instead.
+        Asserting the exact type catches that without a flaky wall-clock bound.
+        """
+        url = (
+            "data:text/html,"
+            "<html><body><div data-print-error='draft-unavailable'>Draft unavailable</div>"
+            "</body></html>"
+        )
+        with pytest.raises(PDFRenderError) as exc_info:
+            await _render_or_skip(url, selector=".resume-print, [data-print-error]")
+        assert type(exc_info.value) is PDFRenderError
+        assert "could not load the resume" in str(exc_info.value)
+        assert "executable" not in str(exc_info.value).lower()

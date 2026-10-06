@@ -4,14 +4,15 @@ import copy
 import json
 import logging
 import re
-from difflib import SequenceMatcher
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any, Callable
 
 from app.llm import complete_json
 from app.prompts import (
     CRITICAL_TRUTHFULNESS_RULES,
     DEFAULT_IMPROVE_PROMPT_ID,
+    DIFF_FIXED_ROWS_INSTRUCTION,
     DIFF_IMPROVE_PROMPT,
     DIFF_STRATEGY_INSTRUCTIONS,
     EXTRACT_KEYWORDS_PROMPT,
@@ -20,8 +21,9 @@ from app.prompts import (
     get_language_name,
 )
 from app.prompts.templates import IMPROVE_SCHEMA_EXAMPLE
-from app.schemas import ResumeData, ResumeFieldDiff, ResumeDiffSummary
+from app.schemas import ResumeData, ResumeDiffSummary, ResumeFieldDiff
 from app.schemas.models import ImproveDiffResult, ResumeChange
+from app.services.parser import has_meaningful_resume_content
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,84 @@ _INJECTION_PATTERNS = [
     r"\[\s*INST\s*\]",
     r"\[\s*/\s*INST\s*\]",
 ]
+
+
+def _validate_string_list_field(
+    result: dict[str, Any],
+    field: str,
+) -> list[str]:
+    """Return a normalized required list of non-empty strings."""
+    value = result.get(field)
+    if not isinstance(value, list):
+        raise ValueError(f"LLM response requires a '{field}' list")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"LLM response field '{field}' must contain text")
+    return [item.strip() for item in value]
+
+
+def _validate_keyword_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate keyword fields consumed by tailoring while allowing sparse output."""
+    validated = dict(result)
+    for field in ("required_skills", "preferred_skills", "keywords"):
+        validated[field] = _validate_string_list_field(result, field)
+    for field in (
+        "experience_requirements",
+        "education_requirements",
+        "key_responsibilities",
+    ):
+        if field in result:
+            validated[field] = _validate_string_list_field(result, field)
+    return validated
+
+
+def _validate_diff_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate an explicit diff result, including a legitimate empty list."""
+    if "changes" not in result:
+        raise ValueError("LLM diff response is missing 'changes'")
+    return ImproveDiffResult.model_validate(result).model_dump()
+
+
+def _validate_skill_plan_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate an explicit skill-target plan without coercing invalid leaves."""
+    raw_targets = result.get("target_skills")
+    if not isinstance(raw_targets, list):
+        raise ValueError("LLM skill plan requires a 'target_skills' list")
+
+    normalized: list[dict[str, str]] = []
+    for target in raw_targets:
+        if isinstance(target, str):
+            skill = target.strip()
+            reason = ""
+        elif isinstance(target, dict):
+            raw_skill = target.get("skill")
+            raw_reason = target.get("reason", "")
+            if not isinstance(raw_skill, str) or not isinstance(raw_reason, str):
+                raise ValueError("Skill targets require text skill and reason fields")
+            skill = raw_skill.strip()
+            reason = raw_reason.strip()
+        else:
+            raise ValueError("Skill targets must be strings or objects")
+        if not skill:
+            raise ValueError("Skill targets cannot be blank")
+        normalized.append({"skill": skill, "reason": reason})
+
+    raw_notes = result.get("strategy_notes", "")
+    if not isinstance(raw_notes, str):
+        raise ValueError("Skill plan strategy_notes must be text")
+
+    return {
+        **result,
+        "target_skills": normalized,
+        "strategy_notes": raw_notes.strip(),
+    }
+
+
+def _validate_resume_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate schema and reject a structurally valid but empty resume."""
+    validated = ResumeData.model_validate(result).model_dump()
+    if not has_meaningful_resume_content(validated):
+        raise ValueError("LLM returned an empty structured resume")
+    return validated
 
 
 @dataclass(frozen=True)
@@ -54,20 +134,6 @@ def _sanitize_user_input(text: str) -> str:
     for pattern in _INJECTION_PATTERNS:
         sanitized = re.sub(pattern, "[REDACTED]", sanitized, flags=re.IGNORECASE)
     return sanitized
-
-
-def _check_for_truncation(data: dict[str, Any]) -> None:
-    """LLM-006: Log warnings for obvious truncation signs before Pydantic validation.
-
-    Note: personalInfo is intentionally excluded — the improve prompts tell the
-    LLM to skip it, and _preserve_personal_info() restores it from the original.
-    """
-
-    # Check for suspiciously empty required arrays
-    if "workExperience" in data and data["workExperience"] == []:
-        logger.warning(
-            "Resume has empty workExperience - possible truncation or unusual resume"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -91,26 +157,30 @@ _ALLOWED_PATH_PATTERNS = [
 ]
 
 # Blocked path prefixes — always rejected
-_BLOCKED_PATH_PREFIXES = frozenset({
-    "personalInfo",
-    "customSections",
-    "sectionMeta",
-})
+_BLOCKED_PATH_PREFIXES = frozenset(
+    {
+        "personalInfo",
+        "customSections",
+        "sectionMeta",
+    }
+)
 
 # Blocked field names — rejected when they appear as the leaf of a path
-_BLOCKED_FIELD_NAMES = frozenset({
-    "years",
-    "company",
-    "institution",
-    "title",
-    "degree",
-    "name",
-    "role",
-    "github",
-    "website",
-    "location",
-    "id",
-})
+_BLOCKED_FIELD_NAMES = frozenset(
+    {
+        "years",
+        "company",
+        "institution",
+        "title",
+        "degree",
+        "name",
+        "role",
+        "github",
+        "website",
+        "location",
+        "id",
+    }
+)
 
 _METRIC_RE = re.compile(r"\d+%|\d+x|\$\d+")
 
@@ -123,7 +193,11 @@ def _is_path_allowed(path: str) -> bool:
 def _is_path_blocked(path: str) -> bool:
     """Check if a path matches any blocked pattern."""
     for prefix in _BLOCKED_PATH_PREFIXES:
-        if path == prefix or path.startswith(prefix + ".") or path.startswith(prefix + "["):
+        if (
+            path == prefix
+            or path.startswith(prefix + ".")
+            or path.startswith(prefix + "[")
+        ):
             return True
 
     # Check if the leaf field is blocked
@@ -223,10 +297,20 @@ def _verify_original_matches(actual: Any, expected: str | list[str] | None) -> b
     return actual.strip().casefold() == expected.strip().casefold()
 
 
+def is_fixed_row_append(
+    change: ResumeChange, fixed_row_sections: tuple[str, ...]
+) -> bool:
+    """Whether ``change`` appends a row to a section whose bullet set is fixed."""
+    section = change.path.split("[", 1)[0]
+    return change.action == "append" and section in fixed_row_sections
+
+
 def apply_diffs(
     original: dict[str, Any],
     changes: list[ResumeChange],
     allowed_skill_targets: list[dict[str, Any] | str] | None = None,
+    *,
+    fixed_row_sections: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], list[ResumeChange], list[ResumeChange]]:
     """Apply verified diffs to original resume.
 
@@ -242,6 +326,8 @@ def apply_diffs(
         original: The original resume data (ResumeData-compatible dict)
         changes: List of changes from the LLM
         allowed_skill_targets: Verified skill targets allowed for add_skill actions
+        fixed_row_sections: Sections whose bullet set the harness already chose;
+            appends to them are rejected so rewriting never adds bullets
 
     Returns:
         (result_dict, applied_changes, rejected_changes)
@@ -298,13 +384,19 @@ def apply_diffs(
             applied.append(change)
 
         elif action == "append":
+            if is_fixed_row_append(change, fixed_row_sections):
+                logger.info("Diff rejected (append to a fixed bullet set): %s", path)
+                rejected.append(change)
+                continue
             if not isinstance(actual_value, list):
                 logger.info("Diff rejected (append to non-list): %s", path)
                 rejected.append(change)
                 continue
             # Append must use a non-empty string (not list, to avoid nested lists)
             if not isinstance(change.value, str) or not change.value.strip():
-                logger.info("Diff rejected (append non-string or empty value): %s", path)
+                logger.info(
+                    "Diff rejected (append non-string or empty value): %s", path
+                )
                 rejected.append(change)
                 continue
             actual_value.append(change.value)
@@ -322,7 +414,9 @@ def apply_diffs(
                 casefold_to_originals: dict[str, list[str]] = {}
                 for item in actual_value:
                     if isinstance(item, str):
-                        casefold_to_originals.setdefault(item.casefold(), []).append(item)
+                        casefold_to_originals.setdefault(item.casefold(), []).append(
+                            item
+                        )
                 for item in change.value:
                     if isinstance(item, str):
                         originals = casefold_to_originals.get(item.casefold(), [])
@@ -341,7 +435,9 @@ def apply_diffs(
                 casefold_to_originals: dict[str, list[str]] = {}
                 for item in actual_value:
                     if isinstance(item, str):
-                        casefold_to_originals.setdefault(item.casefold(), []).append(item)
+                        casefold_to_originals.setdefault(item.casefold(), []).append(
+                            item
+                        )
                 original_cfs = set(casefold_to_originals)
                 is_skills = path == "additional.technicalSkills"
                 added_new: set[str] = set()
@@ -351,16 +447,22 @@ def apply_diffs(
                     cf = item.casefold()
                     if cf in original_cfs:
                         bucket = casefold_to_originals[cf]
-                        if bucket:  # place original in requested position (dupes preserved)
+                        if (
+                            bucket
+                        ):  # place original in requested position (dupes preserved)
                             reordered.append(bucket.pop(0))
                         # else: a duplicate of an already-placed original — skip
                     elif is_skills and cf not in added_new:
                         skill = item.strip()
                         if skill and _normalize_skill_key(skill) in allowed_skill_keys:
-                            reordered.append(skill)  # verified new skill, requested position
+                            reordered.append(
+                                skill
+                            )  # verified new skill, requested position
                             added_new.add(cf)
                         else:
-                            logger.info("Reorder salvage dropped unverified skill: %s", skill)
+                            logger.info(
+                                "Reorder salvage dropped unverified skill: %s", skill
+                            )
                     # else: non-skills new item → dropped (no verifier to ground it)
                 for item in actual_value:  # append any originals the model omitted
                     if isinstance(item, str):
@@ -388,16 +490,16 @@ def apply_diffs(
                 continue
             new_skill = change.value.strip()
             existing = {
-                item.casefold()
-                for item in actual_value
-                if isinstance(item, str)
+                item.casefold() for item in actual_value if isinstance(item, str)
             }
             if new_skill.casefold() in existing:
                 logger.info("Diff rejected (duplicate skill): %s", new_skill)
                 rejected.append(change)
                 continue
             if _normalize_skill_key(new_skill) not in allowed_skill_keys:
-                logger.info("Diff rejected (skill not in verified targets): %s", new_skill)
+                logger.info(
+                    "Diff rejected (skill not in verified targets): %s", new_skill
+                )
                 rejected.append(change)
                 continue
             actual_value.append(new_skill)
@@ -511,6 +613,8 @@ async def generate_resume_diffs(
     prompt_id: str | None = None,
     original_resume_data: dict[str, Any] | None = None,
     skill_targets: list[dict[str, Any]] | None = None,
+    *,
+    fixed_row_sections: tuple[str, ...] = (),
 ) -> ImproveDiffResult:
     """Generate targeted resume diffs via LLM.
 
@@ -525,6 +629,8 @@ async def generate_resume_diffs(
         prompt_id: Strategy id (nudge/keywords/full)
         original_resume_data: Structured resume JSON
         skill_targets: Verified skill targets from the planning pass
+        fixed_row_sections: Sections whose bullet set the harness already chose;
+            the prompt tells the LLM not to append bullets to them
 
     Returns:
         ImproveDiffResult with list of changes and strategy notes
@@ -541,6 +647,10 @@ async def generate_resume_diffs(
     strategy_instruction = DIFF_STRATEGY_INSTRUCTIONS.get(
         selected_id, DIFF_STRATEGY_INSTRUCTIONS[DEFAULT_IMPROVE_PROMPT_ID]
     )
+    if fixed_row_sections:
+        strategy_instruction += " " + DIFF_FIXED_ROWS_INSTRUCTION.format(
+            sections=" and ".join(fixed_row_sections)
+        )
 
     # LLM-011: Sanitize job description
     sanitized_jd = _sanitize_user_input(job_description)
@@ -548,7 +658,7 @@ async def generate_resume_diffs(
     # Use structured JSON if available with month precision, else markdown
     if original_resume_data is not None:
         if _has_month_in_dates(original_resume_data):
-            resume_input = json.dumps(original_resume_data)
+            resume_input = json.dumps(original_resume_data, ensure_ascii=False)
         else:
             resume_input = original_resume
     else:
@@ -568,37 +678,10 @@ async def generate_resume_diffs(
         system_prompt="You are an expert resume editor. Output only valid JSON with targeted changes.",
         max_tokens=4096,
         schema_type="diff",
+        response_validator=_validate_diff_result,
     )
 
-    # Parse result — handle LLM ignoring diff format gracefully
-    raw_changes = result.get("changes", [])
-    if not isinstance(raw_changes, list):
-        logger.warning("LLM returned non-list changes: %s", type(raw_changes))
-        raw_changes = []
-
-    changes: list[ResumeChange] = []
-    for raw in raw_changes:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            changes.append(
-                ResumeChange(
-                    path=str(raw.get("path", "")),
-                    action=raw.get("action", "replace"),
-                    original=raw.get("original"),
-                    value=raw.get("value", ""),
-                    reason=str(raw.get("reason", "")),
-                )
-            )
-        except Exception as e:
-            logger.warning("Skipping malformed change: %s — %s", raw, e)
-
-    strategy_notes = str(result.get("strategy_notes", ""))
-    if not raw_changes and "changes" not in result:
-        strategy_notes = "LLM output had no changes key — returned zero diffs"
-        logger.warning("LLM output missing 'changes' key: %s", list(result.keys()))
-
-    return ImproveDiffResult(changes=changes, strategy_notes=strategy_notes)
+    return ImproveDiffResult.model_validate(_validate_diff_result(result))
 
 
 async def extract_job_keywords(job_description: str) -> dict[str, Any]:
@@ -614,11 +697,13 @@ async def extract_job_keywords(job_description: str) -> dict[str, Any]:
     sanitized_jd = _sanitize_user_input(job_description)
     prompt = EXTRACT_KEYWORDS_PROMPT.format(job_description=sanitized_jd)
 
-    return await complete_json(
+    result = await complete_json(
         prompt=prompt,
         system_prompt="You are an expert job description analyzer.",
         schema_type="keywords",
+        response_validator=_validate_keyword_result,
     )
+    return _validate_keyword_result(result)
 
 
 MONTH_PATTERN = re.compile(
@@ -663,7 +748,9 @@ def _prepare_keywords_for_prompt(job_keywords: dict[str, Any]) -> str:
 
     required = job_keywords.get("required_skills", [])
     if required:
-        sections.append("Required skills to emphasize:\n- " + "\n- ".join(str(s) for s in required))
+        sections.append(
+            "Required skills to emphasize:\n- " + "\n- ".join(str(s) for s in required)
+        )
 
     preferred = job_keywords.get("preferred_skills", [])
     if preferred:
@@ -674,7 +761,10 @@ def _prepare_keywords_for_prompt(job_keywords: dict[str, Any]) -> str:
 
     keywords = job_keywords.get("keywords", [])
     if keywords:
-        sections.append("Additional keywords to weave in naturally:\n- " + "\n- ".join(str(k) for k in keywords))
+        sections.append(
+            "Additional keywords to weave in naturally:\n- "
+            + "\n- ".join(str(k) for k in keywords)
+        )
 
     return "\n\n".join(sections) if sections else "No specific keywords extracted."
 
@@ -864,29 +954,9 @@ async def generate_skill_target_plan(
         ),
         max_tokens=2048,
         schema_type="diff",
+        response_validator=_validate_skill_plan_result,
     )
-
-    raw_targets = result.get("target_skills", [])
-    target_skills: list[dict[str, str]] = []
-    if isinstance(raw_targets, list):
-        for raw in raw_targets:
-            if isinstance(raw, str):
-                skill = raw.strip()
-                reason = ""
-            elif isinstance(raw, dict):
-                skill = str(raw.get("skill", "")).strip()
-                reason = str(raw.get("reason", "")).strip()
-            else:
-                continue
-            if skill:
-                target_skills.append({"skill": skill, "reason": reason})
-    else:
-        logger.warning("Skill target plan returned non-list target_skills")
-
-    return {
-        "target_skills": target_skills,
-        "strategy_notes": str(result.get("strategy_notes", "")),
-    }
+    return _validate_skill_plan_result(result)
 
 
 def _prepare_skill_targets_for_prompt(
@@ -929,7 +999,7 @@ async def improve_resume(
     Returns:
         Improved resume data matching ResumeData schema
 
-    LLM-006: Validates for truncation before Pydantic validation.
+    LLM-006: Validates the structured result inside the content-retry budget.
     LLM-011: Sanitizes job description to prevent prompt injection.
     """
     keywords_str = _prepare_keywords_for_prompt(job_keywords)
@@ -979,14 +1049,9 @@ async def improve_resume(
         prompt=prompt,
         system_prompt="You are an expert resume editor. Output only valid JSON.",
         max_tokens=8192,
+        response_validator=_validate_resume_result,
     )
-
-    # LLM-006: Pre-validation check for truncation signs
-    _check_for_truncation(result)
-
-    # Validate against schema
-    validated = ResumeData.model_validate(result)
-    return validated.model_dump()
+    return _validate_resume_result(result)
 
 
 def _format_entry_label(parts: list[str], fallback: str) -> str:
@@ -1122,7 +1187,9 @@ def _normalize_string_list(value: Any, field_name: str) -> list[str]:
             continue
         invalid_count += 1
     if invalid_count:
-        logger.warning("Skipped non-string entries in %s: %d", field_name, invalid_count)
+        logger.warning(
+            "Skipped non-string entries in %s: %d", field_name, invalid_count
+        )
     return normalized
 
 
@@ -1140,7 +1207,9 @@ def _build_string_index(value: Any, field_name: str) -> dict[str, str]:
 def _extract_description_list(entry: Any) -> list[str]:
     if not isinstance(entry, dict):
         return []
-    return _normalize_string_list(entry.get("description", []), "workExperience.description")
+    return _normalize_string_list(
+        entry.get("description", []), "workExperience.description"
+    )
 
 
 def _append_list_changes(
@@ -1269,22 +1338,26 @@ def calculate_resume_diff(
     orig_skill_keys = set(orig_skills)
     new_skill_keys = set(new_skills)
     for skill_key in new_skill_keys - orig_skill_keys:
-        changes.append(ResumeFieldDiff(
-            field_path="additional.technicalSkills",
-            field_type="skill",
-            change_type="added",
-            new_value=new_skills[skill_key],
-            confidence="high"  # Newly added skills are high risk
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.technicalSkills",
+                field_type="skill",
+                change_type="added",
+                new_value=new_skills[skill_key],
+                confidence="high",  # Newly added skills are high risk
+            )
+        )
 
     for skill_key in orig_skill_keys - new_skill_keys:
-        changes.append(ResumeFieldDiff(
-            field_path="additional.technicalSkills",
-            field_type="skill",
-            change_type="removed",
-            original_value=orig_skills[skill_key],
-            confidence="medium"
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.technicalSkills",
+                field_type="skill",
+                change_type="removed",
+                original_value=orig_skills[skill_key],
+                confidence="medium",
+            )
+        )
 
     # 3. Compare work experience descriptions
     original_experiences = original.get("workExperience", [])
@@ -1321,22 +1394,26 @@ def calculate_resume_diff(
     orig_cert_keys = set(orig_certs)
     new_cert_keys = set(new_certs)
     for cert_key in new_cert_keys - orig_cert_keys:
-        changes.append(ResumeFieldDiff(
-            field_path="additional.certificationsTraining",
-            field_type="certification",
-            change_type="added",
-            new_value=new_certs[cert_key],
-            confidence="high"
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.certificationsTraining",
+                field_type="certification",
+                change_type="added",
+                new_value=new_certs[cert_key],
+                confidence="high",
+            )
+        )
 
     for cert_key in orig_cert_keys - new_cert_keys:
-        changes.append(ResumeFieldDiff(
-            field_path="additional.certificationsTraining",
-            field_type="certification",
-            change_type="removed",
-            original_value=orig_certs[cert_key],
-            confidence="medium"
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.certificationsTraining",
+                field_type="certification",
+                change_type="removed",
+                original_value=orig_certs[cert_key],
+                confidence="medium",
+            )
+        )
 
     # 4b. Compare education descriptions (a single string per entry, not a list)
     original_education = original.get("education", [])
@@ -1362,14 +1439,16 @@ def calculate_resume_diff(
             change_type = "added"
         else:
             change_type = "modified"
-        changes.append(ResumeFieldDiff(
-            field_path=f"education[{idx}].description",
-            field_type="education",
-            change_type=change_type,
-            original_value=orig_desc or None,
-            new_value=impr_desc or None,
-            confidence="medium",
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path=f"education[{idx}].description",
+                field_type="education",
+                change_type=change_type,
+                original_value=orig_desc or None,
+                new_value=impr_desc or None,
+                confidence="medium",
+            )
+        )
 
     # 4c. Compare languages (order changes are intentionally ignored)
     orig_langs = _build_string_index(
@@ -1381,21 +1460,25 @@ def calculate_resume_diff(
         "additional.languages",
     )
     for lang_key in set(new_langs) - set(orig_langs):
-        changes.append(ResumeFieldDiff(
-            field_path="additional.languages",
-            field_type="language",
-            change_type="added",
-            new_value=new_langs[lang_key],
-            confidence="high",
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.languages",
+                field_type="language",
+                change_type="added",
+                new_value=new_langs[lang_key],
+                confidence="high",
+            )
+        )
     for lang_key in set(orig_langs) - set(new_langs):
-        changes.append(ResumeFieldDiff(
-            field_path="additional.languages",
-            field_type="language",
-            change_type="removed",
-            original_value=orig_langs[lang_key],
-            confidence="medium",
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.languages",
+                field_type="language",
+                change_type="removed",
+                original_value=orig_langs[lang_key],
+                confidence="medium",
+            )
+        )
 
     # 4d. Compare awards (order changes are intentionally ignored)
     orig_awards = _build_string_index(
@@ -1407,21 +1490,25 @@ def calculate_resume_diff(
         "additional.awards",
     )
     for award_key in set(new_awards) - set(orig_awards):
-        changes.append(ResumeFieldDiff(
-            field_path="additional.awards",
-            field_type="award",
-            change_type="added",
-            new_value=new_awards[award_key],
-            confidence="high",
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.awards",
+                field_type="award",
+                change_type="added",
+                new_value=new_awards[award_key],
+                confidence="high",
+            )
+        )
     for award_key in set(orig_awards) - set(new_awards):
-        changes.append(ResumeFieldDiff(
-            field_path="additional.awards",
-            field_type="award",
-            change_type="removed",
-            original_value=orig_awards[award_key],
-            confidence="medium",
-        ))
+        changes.append(
+            ResumeFieldDiff(
+                field_path="additional.awards",
+                field_type="award",
+                change_type="removed",
+                original_value=orig_awards[award_key],
+                confidence="medium",
+            )
+        )
 
     # 5. Compare added/removed/modified entries
     # Descriptions are diffed separately; ignore them when detecting entry-level changes.
@@ -1441,7 +1528,9 @@ def calculate_resume_diff(
         original.get("education", []),
         improved.get("education", []),
         _format_education_entry,
-        {"description"},  # diffed separately in step 4b — avoid duplicate entry-level diffs
+        {
+            "description"
+        },  # diffed separately in step 4b — avoid duplicate entry-level diffs
     )
     _append_entry_changes(
         changes,
@@ -1455,8 +1544,16 @@ def calculate_resume_diff(
     # 6. Build summary
     summary = ResumeDiffSummary(
         total_changes=len(changes),
-        skills_added=len([c for c in changes if c.field_type == "skill" and c.change_type == "added"]),
-        skills_removed=len([c for c in changes if c.field_type == "skill" and c.change_type == "removed"]),
+        skills_added=len(
+            [c for c in changes if c.field_type == "skill" and c.change_type == "added"]
+        ),
+        skills_removed=len(
+            [
+                c
+                for c in changes
+                if c.field_type == "skill" and c.change_type == "removed"
+            ]
+        ),
         descriptions_modified=len(
             [
                 c
@@ -1464,8 +1561,14 @@ def calculate_resume_diff(
                 if c.field_type == "description" and c.change_type == "modified"
             ]
         ),
-        certifications_added=len([c for c in changes if c.field_type == "certification" and c.change_type == "added"]),
-        high_risk_changes=len([c for c in changes if c.confidence == "high"])
+        certifications_added=len(
+            [
+                c
+                for c in changes
+                if c.field_type == "certification" and c.change_type == "added"
+            ]
+        ),
+        high_risk_changes=len([c for c in changes if c.confidence == "high"]),
     )
 
     return summary, changes

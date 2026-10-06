@@ -1,12 +1,8 @@
-"""End-to-end pipeline test through the REAL routers + a REAL (isolated) TinyDB.
+"""End-to-end pipeline tests through real routers and isolated SQLite.
 
-Every existing integration test mocks the database away (``patch("...db")``), so
-nothing proves that the core user journey actually persists through the routers.
-This module fills that gap: it drives the genuine FastAPI app against the
-disposable ``isolated_db`` fixture (a temp-file ``Database`` swapped into every
-router module) and asserts real persisted state via the yielded db — not just
-status codes. Only the LLM boundaries are mocked; the routers, schemas,
-validation, and TinyDB persistence are all real.
+This module drives the FastAPI app against the disposable ``isolated_db``
+fixture and checks persisted state through the yielded Database. AI boundaries
+use synthetic responses; routers, schemas, validation and SQLite are real.
 
 Pipeline stages covered:
     upload  -> POST /api/v1/resumes/upload (parse_document + parse_resume_to_json mocked)
@@ -23,11 +19,13 @@ Mock/AsyncMock returning canned data.
 
 import copy
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.database import Database
 from app.main import app
 from app.schemas.models import ResumeData
 
@@ -82,13 +80,13 @@ class TestPipelineCore:
     """The minimum bar: upload -> store -> jobs -> fetch, end to end."""
 
     async def test_upload_persists_master_resume_through_router(
-        self, isolated_db, sample_resume
-    ):
+        self, isolated_db: Database, sample_resume: dict[str, Any]
+    ) -> None:
         """Upload a fake PDF; assert the resume is the persisted master, marked
-        ``ready``, with ``processed_data`` round-tripped through real TinyDB.
+        ``ready``, with ``processed_data`` round-tripped through real SQLite.
 
         This proves the upload handler actually wires parse_document ->
-        parse_resume_to_json -> create_resume_atomic_master -> update_resume
+        parse_resume_to_json -> create_resume_atomic_master -> token-guarded finish
         against a real database, which the DB-mocking tests cannot.
         """
         resp = await _upload_resume(isolated_db, sample_resume)
@@ -109,15 +107,11 @@ class TestPipelineCore:
         # processed_data round-tripped through TinyDB JSON storage.
         assert master["processed_data"] is not None
         assert master["processed_data"]["personalInfo"]["name"] == "Jane Doe"
-        assert (
-            master["processed_data"]["summary"] == sample_resume["summary"]
-        )
+        assert master["processed_data"]["summary"] == sample_resume["summary"]
         # Exactly one resume exists, and it is the master.
         assert len(await isolated_db.list_resumes()) == 1
 
-    async def test_jobs_upload_persists_job_through_router(
-        self, isolated_db, client
-    ):
+    async def test_jobs_upload_persists_job_through_router(self, isolated_db, client):
         """POST /jobs/upload stores the JD text and returns a job_id that is
         actually retrievable from the real db; stats reflect one job.
 
@@ -392,7 +386,9 @@ class TestTailoringPipeline:
         async with _new_client() as client:
             jobs_resp = await client.post(
                 "/api/v1/jobs/upload",
-                json={"job_descriptions": ["Senior Backend Engineer: Python, FastAPI."]},
+                json={
+                    "job_descriptions": ["Senior Backend Engineer: Python, FastAPI."]
+                },
             )
         assert jobs_resp.status_code == 200
         job_id = jobs_resp.json()["job_id"][0]
@@ -493,7 +489,9 @@ class TestConfigurableImproveTimeout:
         from app.config import settings
 
         # Seed a master resume + a job through the real routers.
-        resume_id = (await _upload_resume(isolated_db, sample_resume)).json()["resume_id"]
+        resume_id = (await _upload_resume(isolated_db, sample_resume)).json()[
+            "resume_id"
+        ]
         async with _new_client() as client:
             jr = await client.post(
                 "/api/v1/jobs/upload",

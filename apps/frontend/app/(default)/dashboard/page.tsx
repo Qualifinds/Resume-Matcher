@@ -25,9 +25,13 @@ import {
   deleteResume,
   retryProcessing,
   fetchJobDescription,
+  setDefaultMasterResume,
+  duplicateResume,
+  MAX_MASTER_RESUMES,
   type ResumeListItem,
 } from '@/lib/api/resume';
 import { useStatusCache } from '@/lib/context/status-cache';
+import { hasMeaningfulResumeContent } from '@/lib/utils/resume-content';
 
 type ProcessingStatus = 'pending' | 'processing' | 'ready' | 'failed' | 'loading';
 
@@ -36,10 +40,19 @@ export default function DashboardPage() {
   const [masterResumeId, setMasterResumeId] = useState<string | null>(null);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>('loading');
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [listError, setListError] = useState(false);
+  const [deleteError, setDeleteError] = useState(false);
+  // One dialog for failed tile actions (set default, duplicate, re-upload default).
+  const [actionError, setActionError] = useState<string | null>(null);
   const [tailoredResumes, setTailoredResumes] = useState<ResumeListItem[]>([]);
+  const [otherMasters, setOtherMasters] = useState<ResumeListItem[]>([]);
+  const [defaultMasterTitle, setDefaultMasterTitle] = useState<string | null>(null);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [isDuplicating, setIsDuplicating] = useState(false);
   const [isUploadDialogOpen, setIsUploadDialogOpen] = useState(false);
   const [isMasterChoiceDialogOpen, setIsMasterChoiceDialogOpen] = useState(false);
+  // Set by "Delete and re-upload": the next completed upload replaces the deleted default.
+  const [reuploadReplacesDefault, setReuploadReplacesDefault] = useState(false);
   const router = useRouter();
 
   // Status cache for optimistic counter updates and LLM status check
@@ -50,17 +63,35 @@ export default function DashboardPage() {
     decrementResumes,
     setHasMasterResume,
   } = useStatusCache();
+  // Read through a ref so the list reconcile keeps a stable identity (it drives the load effects).
+  const setHasMasterResumeRef = useRef(setHasMasterResume);
+  useEffect(() => {
+    setHasMasterResumeRef.current = setHasMasterResume;
+  }, [setHasMasterResume]);
 
   // Request id guard for concurrent loadTailoredResumes invocations
   const loadRequestIdRef = useRef(0);
+  const statusRequestIdRef = useRef(0);
+  const retryMasterRef = useRef<string | null>(null);
+  const pollAttemptsRef = useRef(0);
+  const otherMastersPollAttemptsRef = useRef(0);
+  const [statusRevision, setStatusRevision] = useState(0);
+  // Bumped when the latest list load ends without new data, so the extra-master poll it
+  // superseded is rescheduled (a successful load re-arms it through `otherMasters`).
+  const [listRevision, setListRevision] = useState(0);
+  const activeMasterIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
   // Lightweight in-memory cache for job snippets to avoid N+1 refetches
   const jobSnippetCacheRef = useRef<Record<string, string>>({});
 
   // Check if LLM is configured (API key is set)
   const isLlmConfigured = !statusLoading && systemStatus?.llm_configured;
 
-  const isTailorEnabled =
-    Boolean(masterResumeId) && processingStatus === 'ready' && isLlmConfigured;
+  // Any ready master can be tailored (the tailor page picks the default, else the
+  // stored id, else the first ready one), so a failed default must not block the rest.
+  const hasReadyMaster =
+    processingStatus === 'ready' || otherMasters.some((r) => r.processing_status === 'ready');
+  const isTailorEnabled = Boolean(masterResumeId) && hasReadyMaster && isLlmConfigured;
 
   const formatDate = (value: string) => {
     if (!value) return t('common.unknown');
@@ -76,92 +107,195 @@ export default function DashboardPage() {
     });
   };
 
-  const checkResumeStatus = useCallback(async (resumeId: string) => {
-    try {
-      setProcessingStatus('loading');
-      const data = await fetchResume(resumeId);
-      const status = data.raw_resume?.processing_status || 'pending';
-      setProcessingStatus(status as ProcessingStatus);
-    } catch (err: unknown) {
-      console.error('Failed to check resume status:', err);
-      // If resume not found (404), clear the stale localStorage
-      if (err instanceof Error && err.message.includes('404')) {
-        localStorage.removeItem('master_resume_id');
-        setMasterResumeId(null);
-        return;
-      }
-      setProcessingStatus('failed');
+  const adoptMasterResume = useCallback((resumeId: string | null) => {
+    if (activeMasterIdRef.current !== resumeId) {
+      statusRequestIdRef.current += 1;
+      retryMasterRef.current = null;
+      pollAttemptsRef.current = 0;
+      setIsRetrying(false);
     }
+    activeMasterIdRef.current = resumeId;
+    setMasterResumeId(resumeId);
   }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadRequestIdRef.current += 1;
+      statusRequestIdRef.current += 1;
+    };
+  }, []);
+
+  const checkResumeStatus = useCallback(
+    async (resumeId: string, background = false) => {
+      if (
+        !mountedRef.current ||
+        activeMasterIdRef.current !== resumeId ||
+        retryMasterRef.current === resumeId
+      )
+        return;
+      if (!background) pollAttemptsRef.current = 0;
+      const requestId = ++statusRequestIdRef.current;
+      const isCurrent = () =>
+        mountedRef.current &&
+        requestId === statusRequestIdRef.current &&
+        activeMasterIdRef.current === resumeId;
+      try {
+        if (!background) setProcessingStatus('loading');
+        const data = await fetchResume(resumeId);
+        if (!isCurrent()) return;
+        const savedStatus = data.raw_resume?.processing_status || 'pending';
+        // Older backend versions accepted `{}` as a valid ResumeData object.
+        // Surface that legacy state as failed so users can retry it safely.
+        const status =
+          savedStatus === 'ready' && !hasMeaningfulResumeContent(data.processed_resume)
+            ? 'failed'
+            : savedStatus;
+        setProcessingStatus(status as ProcessingStatus);
+      } catch (err: unknown) {
+        if (!isCurrent()) return;
+        console.error('Failed to check resume status:', err);
+        // If resume not found (404), clear the stale localStorage
+        if (err instanceof Error && err.message.includes('404')) {
+          localStorage.removeItem('master_resume_id');
+          adoptMasterResume(null);
+          return;
+        }
+        setProcessingStatus('failed');
+      } finally {
+        if (isCurrent()) setStatusRevision((version) => version + 1);
+      }
+    },
+    [adoptMasterResume]
+  );
 
   useEffect(() => {
     const storedId = localStorage.getItem('master_resume_id');
     if (storedId) {
-      setMasterResumeId(storedId);
+      adoptMasterResume(storedId);
       checkResumeStatus(storedId);
     }
-  }, [checkResumeStatus]);
+  }, [adoptMasterResume, checkResumeStatus]);
 
-  const loadTailoredResumes = useCallback(async () => {
-    try {
-      const data = await fetchResumeList(true);
-      const masterFromList = data.find((r) => r.is_master);
-      const storedId = localStorage.getItem('master_resume_id');
-      const resolvedMasterId = masterFromList?.resume_id || storedId;
+  // A bounded backoff preserves the processing label and never overlaps requests.
+  // Focus or an explicit refresh starts a fresh observation window.
+  useEffect(() => {
+    if (
+      !masterResumeId ||
+      isRetrying ||
+      !['pending', 'processing'].includes(processingStatus) ||
+      pollAttemptsRef.current >= 12
+    )
+      return;
+    const requestId = statusRequestIdRef.current;
+    const delay = Math.min(30_000, 3_000 * 2 ** pollAttemptsRef.current);
+    const timer = window.setTimeout(() => {
+      if (requestId !== statusRequestIdRef.current || document.hidden) return;
+      pollAttemptsRef.current += 1;
+      void checkResumeStatus(masterResumeId, true);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [masterResumeId, processingStatus, isRetrying, statusRevision, checkResumeStatus]);
 
-      if (resolvedMasterId) {
-        localStorage.setItem('master_resume_id', resolvedMasterId);
-        setMasterResumeId(resolvedMasterId);
-        checkResumeStatus(resolvedMasterId);
-      } else {
-        localStorage.removeItem('master_resume_id');
-        setMasterResumeId(null);
-      }
-
-      const filtered = data.filter((r) => r.resume_id !== resolvedMasterId);
-      setTailoredResumes(filtered);
-
-      // Only fetch job descriptions for resumes that are actually tailored
-      // (identified by having a non-null parent_id). This avoids N+1 calls
-      // for untailored resumes.
-      const tailoredWithParent = filtered.filter((r) => r.parent_id);
-
-      // Guard against concurrent invocations overwriting each other
+  // `background` marks a poll-driven refresh: it must not reset the default master's
+  // observation window or flash its status back to "checking".
+  const loadTailoredResumes = useCallback(
+    async (background = false) => {
       const requestId = ++loadRequestIdRef.current;
+      const isCurrent = () => mountedRef.current && requestId === loadRequestIdRef.current;
+      try {
+        setListError(false);
+        const data = await fetchResumeList(true);
+        if (!isCurrent()) return;
+        const masters = data.filter((r) => r.is_master);
+        // Server truth for the shared flag Settings reads; other pages can leave it stale.
+        setHasMasterResumeRef.current(masters.length > 0);
+        const masterFromList = masters.find((r) => r.is_default_master) ?? masters[0];
+        const storedId = localStorage.getItem('master_resume_id');
+        const resolvedMasterId = masterFromList?.resume_id || storedId;
 
-      // Fetch job description snippets for tailored resumes in parallel and attach to state
-      // Use a small in-memory cache to avoid re-fetching the same snippet repeatedly.
-      const jobSnippets: Record<string, string> = {};
-      await Promise.all(
-        tailoredWithParent.map(async (r) => {
-          // Use cached snippet when available
-          if (jobSnippetCacheRef.current[r.resume_id]) {
-            jobSnippets[r.resume_id] = jobSnippetCacheRef.current[r.resume_id];
-            return;
-          }
-          try {
-            const jd = await fetchJobDescription(r.resume_id);
-            const snippet = (jd?.content || '').slice(0, 80);
-            jobSnippetCacheRef.current[r.resume_id] = snippet;
-            jobSnippets[r.resume_id] = snippet;
-          } catch {
-            // ignore missing job descriptions and cache empty result
-            jobSnippetCacheRef.current[r.resume_id] = '';
-            jobSnippets[r.resume_id] = '';
-          }
-        })
-      );
+        if (resolvedMasterId) {
+          const sameMaster = activeMasterIdRef.current === resolvedMasterId;
+          localStorage.setItem('master_resume_id', resolvedMasterId);
+          adoptMasterResume(resolvedMasterId);
+          checkResumeStatus(resolvedMasterId, background && sameMaster);
+        } else {
+          localStorage.removeItem('master_resume_id');
+          adoptMasterResume(null);
+        }
 
-      // Only apply results if this invocation is the latest (prevents stale overwrite)
-      if (requestId === loadRequestIdRef.current) {
-        setTailoredResumes((prev) =>
-          prev.map((r) => ({ ...r, jobSnippet: jobSnippets[r.resume_id] || '' }))
+        setOtherMasters(masters.filter((r) => r.resume_id !== resolvedMasterId));
+        setDefaultMasterTitle(masterFromList?.title ?? null);
+        const filtered = data.filter((r) => !r.is_master && r.resume_id !== resolvedMasterId);
+        setTailoredResumes(filtered);
+
+        // Only fetch job descriptions for resumes that are actually tailored
+        // (identified by having a non-null parent_id). This avoids N+1 calls
+        // for untailored resumes.
+        const tailoredWithParent = filtered.filter((r) => r.parent_id);
+
+        // Fetch job description snippets for tailored resumes in parallel and attach to state
+        // Use a small in-memory cache to avoid re-fetching the same snippet repeatedly.
+        const jobSnippets: Record<string, string> = {};
+        await Promise.all(
+          tailoredWithParent.map(async (r) => {
+            // Use cached snippet when available
+            if (jobSnippetCacheRef.current[r.resume_id]) {
+              jobSnippets[r.resume_id] = jobSnippetCacheRef.current[r.resume_id];
+              return;
+            }
+            try {
+              const jd = await fetchJobDescription(r.resume_id);
+              const snippet = (jd?.content || '').slice(0, 80);
+              if (isCurrent()) jobSnippetCacheRef.current[r.resume_id] = snippet;
+              jobSnippets[r.resume_id] = snippet;
+            } catch {
+              // ignore missing job descriptions and cache empty result
+              if (isCurrent()) jobSnippetCacheRef.current[r.resume_id] = '';
+              jobSnippets[r.resume_id] = '';
+            }
+          })
         );
+
+        // Only apply results if this invocation is the latest (prevents stale overwrite)
+        if (isCurrent()) {
+          setTailoredResumes((prev) =>
+            prev.map((r) => ({ ...r, jobSnippet: jobSnippets[r.resume_id] || '' }))
+          );
+        }
+      } catch (err) {
+        if (!isCurrent()) return;
+        console.error('Failed to load tailored resumes:', err);
+        setListError(true);
+        setListRevision((version) => version + 1);
       }
-    } catch (err) {
-      console.error('Failed to load tailored resumes:', err);
+    },
+    [adoptMasterResume, checkResumeStatus]
+  );
+
+  // Extra masters parse in the background; refresh the list with the same bounded
+  // backoff as the default master until none is pending or processing.
+  useEffect(() => {
+    const isParsing = otherMasters.some((r) =>
+      ['pending', 'processing'].includes(r.processing_status)
+    );
+    if (!isParsing) {
+      otherMastersPollAttemptsRef.current = 0;
+      return;
     }
-  }, [checkResumeStatus]);
+    if (otherMastersPollAttemptsRef.current >= 12) return;
+    // A reload started after scheduling (focus, upload, an action) supersedes this
+    // poll; the list it loads, or `listRevision` when it fails, re-runs this effect.
+    const requestId = loadRequestIdRef.current;
+    const delay = Math.min(30_000, 3_000 * 2 ** otherMastersPollAttemptsRef.current);
+    const timer = window.setTimeout(() => {
+      if (requestId !== loadRequestIdRef.current || document.hidden) return;
+      otherMastersPollAttemptsRef.current += 1;
+      void loadTailoredResumes(true);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [otherMasters, listRevision, loadTailoredResumes]);
 
   useEffect(() => {
     loadTailoredResumes();
@@ -170,6 +304,7 @@ export default function DashboardPage() {
   // Refresh list when window gains focus (e.g., returning from viewer after delete)
   useEffect(() => {
     const handleFocus = () => {
+      otherMastersPollAttemptsRef.current = 0;
       loadTailoredResumes();
     };
     window.addEventListener('focus', handleFocus);
@@ -177,13 +312,77 @@ export default function DashboardPage() {
   }, [loadTailoredResumes, checkResumeStatus]);
 
   const handleUploadComplete = (resumeId: string) => {
-    localStorage.setItem('master_resume_id', resumeId);
-    setMasterResumeId(resumeId);
-    // Check status after upload completes
-    checkResumeStatus(resumeId);
     // Update cached counters
     incrementResumes();
     setHasMasterResume(true);
+    if (reuploadReplacesDefault) {
+      setReuploadReplacesDefault(false);
+      otherMastersPollAttemptsRef.current = 0;
+      void makeReuploadDefault(resumeId);
+      return;
+    }
+    // Only the first upload becomes the default; later ones join the other masters
+    if (!masterResumeId) {
+      localStorage.setItem('master_resume_id', resumeId);
+      adoptMasterResume(resumeId);
+      // Check status after upload completes
+      checkResumeStatus(resumeId);
+    }
+    otherMastersPollAttemptsRef.current = 0;
+    void loadTailoredResumes();
+  };
+
+  // Deleting the old default promoted another track on the server, so the
+  // re-upload takes the default explicitly. The list reload shows it either way.
+  const makeReuploadDefault = async (resumeId: string) => {
+    try {
+      await setDefaultMasterResume(resumeId);
+      localStorage.setItem('master_resume_id', resumeId);
+    } catch (err) {
+      console.error('Failed to set the re-uploaded resume as default:', err);
+      // Close the upload dialog (still showing success until its 1.5 s auto-close) in the
+      // same render, so the error never stacks on it or loses the scroll lock when it closes.
+      setIsUploadDialogOpen(false);
+      setActionError(t('resumeViewer.setDefaultError'));
+    }
+    await loadTailoredResumes();
+  };
+
+  const handleUploadDialogOpenChange = (open: boolean) => {
+    setIsUploadDialogOpen(open);
+    // A re-upload dialog closed without an upload ends the replacement.
+    if (!open) setReuploadReplacesDefault(false);
+  };
+
+  const handleSetDefault = async (e: React.MouseEvent, resumeId: string) => {
+    e.stopPropagation();
+    try {
+      await setDefaultMasterResume(resumeId);
+      localStorage.setItem('master_resume_id', resumeId);
+      await loadTailoredResumes();
+    } catch (err) {
+      console.error('Failed to set default master resume:', err);
+      setActionError(t('resumeViewer.setDefaultError'));
+    }
+  };
+
+  const handleDuplicate = async (e: React.MouseEvent, resumeId: string) => {
+    e.stopPropagation();
+    setIsDuplicating(true);
+    try {
+      await duplicateResume(resumeId);
+      incrementResumes();
+      await loadTailoredResumes();
+    } catch (err) {
+      console.error('Failed to duplicate resume:', err);
+      // A 409 (master limit, not ready) carries a message written for the user.
+      const isConflict = (err as { status?: number } | null)?.status === 409;
+      setActionError(
+        isConflict && err instanceof Error ? err.message : t('resumeViewer.duplicateError')
+      );
+    } finally {
+      setIsDuplicating(false);
+    }
   };
 
   const handleChooseUpload = () => {
@@ -205,25 +404,45 @@ export default function DashboardPage() {
 
   const handleRetryProcessing = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!masterResumeId) return;
+    if (!masterResumeId || retryMasterRef.current === masterResumeId) return;
+    const resumeId = masterResumeId;
+    retryMasterRef.current = resumeId;
+    const requestId = ++statusRequestIdRef.current;
+    const isCurrent = () =>
+      mountedRef.current &&
+      requestId === statusRequestIdRef.current &&
+      activeMasterIdRef.current === resumeId;
     setIsRetrying(true);
+    setProcessingStatus('loading');
     try {
-      const result = await retryProcessing(masterResumeId);
+      const result = await retryProcessing(resumeId);
+      if (!isCurrent()) return;
       if (result.processing_status === 'ready') {
         setProcessingStatus('ready');
       } else if (
         result.processing_status === 'processing' ||
         result.processing_status === 'pending'
       ) {
+        pollAttemptsRef.current = 0;
         setProcessingStatus(result.processing_status);
       } else {
         setProcessingStatus('failed');
       }
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Retry processing failed:', err);
+      if (err instanceof Error && err.message.includes('status 404')) {
+        localStorage.removeItem('master_resume_id');
+        adoptMasterResume(null);
+        setHasMasterResume(false);
+        return;
+      }
       setProcessingStatus('failed');
     } finally {
-      setIsRetrying(false);
+      if (isCurrent()) {
+        retryMasterRef.current = null;
+        setIsRetrying(false);
+      }
     }
   };
 
@@ -234,17 +453,31 @@ export default function DashboardPage() {
 
   const confirmDeleteAndReupload = async () => {
     if (!masterResumeId) return;
+    const resumeId = masterResumeId;
+    const invalidationId = ++loadRequestIdRef.current;
     try {
-      await deleteResume(masterResumeId);
+      setDeleteError(false);
+      await deleteResume(resumeId);
+      if (!mountedRef.current || activeMasterIdRef.current !== resumeId) return;
       decrementResumes();
-      setHasMasterResume(false);
+      // The server promotes a remaining master, so the flag only clears with the last one.
+      setHasMasterResume(otherMasters.length > 0);
       localStorage.removeItem('master_resume_id');
-      setMasterResumeId(null);
+      adoptMasterResume(null);
       setProcessingStatus('loading');
+      setReuploadReplacesDefault(true);
       setIsUploadDialogOpen(true);
       await loadTailoredResumes();
     } catch (err) {
+      if (!mountedRef.current || activeMasterIdRef.current !== resumeId) return;
       console.error('Failed to delete resume:', err);
+      setShowDeleteDialog(false);
+      setDeleteError(true);
+    } finally {
+      // No reload followed (the delete failed or the master changed): re-arm the poll.
+      if (mountedRef.current && invalidationId === loadRequestIdRef.current) {
+        setListRevision((version) => version + 1);
+      }
     }
   };
 
@@ -304,15 +537,41 @@ export default function DashboardPage() {
     return Math.abs(hash);
   };
 
-  const totalCards = 1 + tailoredResumes.length + 1;
+  const atMasterLimit = 1 + otherMasters.length >= MAX_MASTER_RESUMES;
+  const showAddTrackTile = Boolean(masterResumeId) && !atMasterLimit && isLlmConfigured;
+  const totalCards =
+    1 + otherMasters.length + tailoredResumes.length + 1 + (showAddTrackTile ? 1 : 0);
   const fillerCount = Math.max(0, (5 - (totalCards % 5)) % 5);
   const extraFillerCount = 5;
   // Use Tailwind classes for fillers now that we have them in config or use specific hex if needed
   // Using the hex values from before to maintain exact look, or we could map them to variants
   const fillerPalette = ['bg-secondary', 'bg-[#D8D8D2]', 'bg-[#CFCFC7]', 'bg-[#E0E0D8]'];
 
+  const listErrorAlert = listError ? (
+    <div
+      role="alert"
+      className="m-6 rounded-none border-2 border-red-600 bg-red-100 p-6 shadow-sw-default"
+    >
+      <div className="flex items-start gap-3">
+        <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+        <div>
+          <p className="font-mono text-sm font-bold uppercase text-red-600">
+            {t('dashboard.errors.loadFailed')}
+          </p>
+          <Button className="mt-4" variant="outline" onClick={() => void loadTailoredResumes()}>
+            <RefreshCw className="h-4 w-4" />
+            {t('common.retry')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+  if (listError && !masterResumeId && otherMasters.length === 0 && tailoredResumes.length === 0)
+    return listErrorAlert;
+
   return (
     <div className="space-y-6">
+      {listErrorAlert}
       {/* Configuration Warning Banner */}
       {masterResumeId && !isLlmConfigured && !statusLoading && (
         <div className="border-2 border-warning bg-amber-50 p-4 shadow-sw-default mb-6 flex items-center justify-between">
@@ -368,46 +627,30 @@ export default function DashboardPage() {
               </Card>
             </Link>
           ) : (
-            <>
-              <Card
-                variant="interactive"
-                className="aspect-square h-full hover:bg-primary hover:text-canvas"
-                role="button"
-                tabIndex={0}
-                aria-label={t('dashboard.initializeMasterResume')}
-                onClick={() => setIsMasterChoiceDialogOpen(true)}
-                onKeyDown={handleInitializeMasterKeyDown}
-              >
-                <div className="flex-1 flex flex-col justify-between pointer-events-none">
-                  <div className="w-14 h-14 border-2 border-current flex items-center justify-center mb-4">
-                    <span className="text-2xl leading-none relative top-[-2px]">+</span>
-                  </div>
-                  <div>
-                    <CardTitle className="text-xl uppercase">
-                      {t('dashboard.initializeMasterResume')}
-                    </CardTitle>
-                    <CardDescription className="mt-2 opacity-60 group-hover:opacity-100 text-current">
-                      {'// '}
-                      {t('dashboard.initializeSequence')}
-                    </CardDescription>
-                  </div>
+            <Card
+              variant="interactive"
+              className="aspect-square h-full hover:bg-primary hover:text-canvas"
+              role="button"
+              tabIndex={0}
+              aria-label={t('dashboard.initializeMasterResume')}
+              onClick={() => setIsMasterChoiceDialogOpen(true)}
+              onKeyDown={handleInitializeMasterKeyDown}
+            >
+              <div className="flex-1 flex flex-col justify-between pointer-events-none">
+                <div className="w-14 h-14 border-2 border-current flex items-center justify-center mb-4">
+                  <span className="text-2xl leading-none relative top-[-2px]">+</span>
                 </div>
-              </Card>
-              <MasterResumeChoiceDialog
-                open={isMasterChoiceDialogOpen}
-                onOpenChange={setIsMasterChoiceDialogOpen}
-                onChooseUpload={handleChooseUpload}
-                onChooseWizard={handleChooseWizard}
-              />
-              <ResumeUploadDialog
-                open={isUploadDialogOpen}
-                onOpenChange={setIsUploadDialogOpen}
-                onUploadComplete={handleUploadComplete}
-                trigger={
-                  <button type="button" className="hidden" tabIndex={-1} aria-hidden="true" />
-                }
-              />
-            </>
+                <div>
+                  <CardTitle className="text-xl uppercase">
+                    {t('dashboard.initializeMasterResume')}
+                  </CardTitle>
+                  <CardDescription className="mt-2 opacity-60 group-hover:opacity-100 text-current">
+                    {'// '}
+                    {t('dashboard.initializeSequence')}
+                  </CardDescription>
+                </div>
+              </div>
+            </Card>
           )
         ) : (
           // Master Resume Exists
@@ -444,9 +687,14 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              <CardTitle className="text-lg group-hover:text-primary">
-                {t('dashboard.masterResume')}
-              </CardTitle>
+              <div className="flex items-start gap-2">
+                <CardTitle className="min-w-0 text-lg line-clamp-2 group-hover:text-primary">
+                  {defaultMasterTitle || t('dashboard.masterResume')}
+                </CardTitle>
+                <span className="shrink-0 font-mono text-xs uppercase border border-black px-1 rounded-none">
+                  {t('dashboard.defaultBadge')}
+                </span>
+              </div>
 
               <div
                 className={`text-xs font-mono mt-auto pt-4 flex flex-col gap-2 uppercase ${getStatusDisplay().color}`}
@@ -483,7 +731,79 @@ export default function DashboardPage() {
           </Card>
         )}
 
-        {/* 2. Tailored Resumes */}
+        {/* 2. Other Master Resumes */}
+        {otherMasters.map((resume) => {
+          const title = resume.title || resume.filename || t('dashboard.masterTrack');
+          return (
+            <Card
+              key={resume.resume_id}
+              variant="interactive"
+              className="aspect-square h-full bg-canvas"
+              onClick={() => router.push(`/resumes/${resume.resume_id}`)}
+            >
+              <div className="flex-1 flex flex-col">
+                <div className="flex justify-between items-start mb-6">
+                  <div className="w-12 h-12 border-2 border-black bg-blue-700 text-white flex items-center justify-center">
+                    <span className="font-mono font-bold">M</span>
+                  </div>
+                  <span className="font-mono text-xs text-steel-grey uppercase">
+                    {resume.processing_status}
+                  </span>
+                </div>
+                <CardTitle className="text-lg">
+                  <span className="block font-serif text-base font-bold leading-tight mb-1 w-full line-clamp-2">
+                    {title}
+                  </span>
+                </CardTitle>
+                <div className="mt-auto pt-4 flex flex-wrap gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-xs h-7 rounded-none border-black"
+                    aria-label={t('dashboard.setDefault')}
+                    onClick={(e) => handleSetDefault(e, resume.resume_id)}
+                  >
+                    {t('dashboard.setDefault')}
+                  </Button>
+                  {!atMasterLimit && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-xs h-7 rounded-none border-black"
+                      aria-label={t('dashboard.duplicate')}
+                      disabled={isDuplicating || resume.processing_status !== 'ready'}
+                      onClick={(e) => handleDuplicate(e, resume.resume_id)}
+                    >
+                      {t('dashboard.duplicate')}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+
+        {/* 3. Add Master Track */}
+        {showAddTrackTile && (
+          <Card
+            variant="interactive"
+            className="aspect-square h-full hover:bg-primary hover:text-canvas"
+            role="button"
+            tabIndex={0}
+            aria-label={t('dashboard.addMasterTrack')}
+            onClick={() => setIsMasterChoiceDialogOpen(true)}
+            onKeyDown={handleInitializeMasterKeyDown}
+          >
+            <div className="flex-1 flex flex-col justify-between pointer-events-none">
+              <CardTitle className="text-lg uppercase">+ {t('dashboard.addMasterTrack')}</CardTitle>
+              <CardDescription className="font-mono uppercase opacity-60 group-hover:opacity-100 text-current">
+                {t('dashboard.masterLimitReached', { max: MAX_MASTER_RESUMES })}
+              </CardDescription>
+            </div>
+          </Card>
+        )}
+
+        {/* 4. Tailored Resumes */}
         {tailoredResumes.map((resume) => {
           const title =
             resume.title || resume.jobSnippet || resume.filename || t('dashboard.tailoredResume');
@@ -522,7 +842,7 @@ export default function DashboardPage() {
           );
         })}
 
-        {/* 3. Create Tailored Resume */}
+        {/* 5. Create Tailored Resume */}
         <Card className="aspect-square h-full" variant="default">
           <div className="flex-1 flex flex-col items-center justify-center text-center h-full">
             <Button
@@ -538,7 +858,7 @@ export default function DashboardPage() {
           </div>
         </Card>
 
-        {/* 4. Fillers */}
+        {/* 6. Fillers */}
         {Array.from({ length: fillerCount }).map((_, index) => (
           <Card
             key={`filler-${index}`}
@@ -557,6 +877,20 @@ export default function DashboardPage() {
           />
         ))}
 
+        <MasterResumeChoiceDialog
+          open={isMasterChoiceDialogOpen}
+          onOpenChange={setIsMasterChoiceDialogOpen}
+          onChooseUpload={handleChooseUpload}
+          onChooseWizard={handleChooseWizard}
+        />
+        <ResumeUploadDialog
+          open={isUploadDialogOpen}
+          onOpenChange={handleUploadDialogOpenChange}
+          onUploadComplete={handleUploadComplete}
+          becomesDefault={reuploadReplacesDefault}
+          trigger={<button type="button" className="hidden" tabIndex={-1} aria-hidden="true" />}
+        />
+
         <ConfirmDialog
           open={showDeleteDialog}
           onOpenChange={setShowDeleteDialog}
@@ -566,6 +900,29 @@ export default function DashboardPage() {
           cancelLabel={t('confirmations.keepResumeCancelLabel')}
           onConfirm={confirmDeleteAndReupload}
           variant="danger"
+        />
+
+        <ConfirmDialog
+          open={deleteError}
+          onOpenChange={setDeleteError}
+          title={t('common.error')}
+          description={t('dashboard.errors.deleteFailed')}
+          confirmLabel={t('common.retry')}
+          cancelLabel={t('common.cancel')}
+          onConfirm={confirmDeleteAndReupload}
+          onCancel={() => setDeleteError(false)}
+          variant="danger"
+        />
+
+        <ConfirmDialog
+          open={actionError !== null}
+          onOpenChange={(open) => !open && setActionError(null)}
+          title={t('common.error')}
+          description={actionError ?? ''}
+          confirmLabel={t('common.ok')}
+          onConfirm={() => setActionError(null)}
+          variant="danger"
+          showCancelButton={false}
         />
       </SwissGrid>
     </div>

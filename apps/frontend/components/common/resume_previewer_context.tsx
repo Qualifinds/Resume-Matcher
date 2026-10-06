@@ -1,6 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, ReactNode } from 'react';
+import type { BulletSelectionSummary } from '@/lib/api/resume';
 
 export interface PersonalInfo {
   name: string;
@@ -119,6 +120,8 @@ export interface InterviewPrepData {
 
 export interface Data {
   request_id: string;
+  preview_id?: string | null;
+  preview_expires_at?: string | null;
   resume_id: string | null;
   job_id: string;
   resume_preview: ResumePreview;
@@ -138,6 +141,7 @@ export interface Data {
   diff_summary?: ResumeDiffSummary;
   detailed_changes?: ResumeFieldDiff[];
   ats_score?: ATSScore;
+  bullet_selection?: BulletSelectionSummary | null;
 }
 
 export interface ImprovedResult {

@@ -2,9 +2,9 @@
 
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.database import Database
 from app.main import app
 from app.schemas.applications import APPLICATION_STATUS_ORDER
 
@@ -90,7 +90,9 @@ class TestDetail:
     async def test_detail_embeds_job_and_resume(self, isolated_db):
         resume = await isolated_db.create_resume(content="# Resume")
         job = await isolated_db.create_job(content="JD body text")
-        card = await _seed_card(isolated_db, job_id=job["job_id"], resume_id=resume["resume_id"])
+        card = await _seed_card(
+            isolated_db, job_id=job["job_id"], resume_id=resume["resume_id"]
+        )
         async with _client() as client:
             resp = await client.get(f"/api/v1/applications/{card['application_id']}")
         assert resp.status_code == 200
@@ -100,7 +102,9 @@ class TestDetail:
 
     async def test_detail_tolerates_deleted_resume(self, isolated_db):
         job = await isolated_db.create_job(content="JD")
-        card = await _seed_card(isolated_db, job_id=job["job_id"], resume_id="ghost-resume")
+        card = await _seed_card(
+            isolated_db, job_id=job["job_id"], resume_id="ghost-resume"
+        )
         async with _client() as client:
             resp = await client.get(f"/api/v1/applications/{card['application_id']}")
         assert resp.status_code == 200
@@ -154,7 +158,10 @@ class TestBulkAndDelete:
         async with _client() as client:
             resp = await client.patch(
                 "/api/v1/applications/bulk",
-                json={"application_ids": [a["application_id"], b["application_id"]], "status": "rejected"},
+                json={
+                    "application_ids": [a["application_id"], b["application_id"]],
+                    "status": "rejected",
+                },
             )
         assert resp.status_code == 200
         assert resp.json()["affected"] == 2
@@ -190,7 +197,9 @@ class TestBulkAndDelete:
 class TestRobustnessFixes:
     async def test_create_dedupes_same_job_resume(self, isolated_db):
         """A second card for the same (job, resume) returns the existing one."""
-        first = await _seed_card(isolated_db, job_id="dup-j", resume_id="dup-r", status="applied")
+        first = await _seed_card(
+            isolated_db, job_id="dup-j", resume_id="dup-r", status="applied"
+        )
         second = await isolated_db.create_application(
             job_id="dup-j", resume_id="dup-r", status="applied"
         )
@@ -201,7 +210,9 @@ class TestRobustnessFixes:
 
     async def test_unknown_status_is_skipped_not_500(self, isolated_db):
         """A row whose status is outside the enum must not 500 the board."""
-        await isolated_db.create_application(job_id="j1", resume_id="r1", status="bogus_status")
+        await isolated_db.create_application(
+            job_id="j1", resume_id="r1", status="bogus_status"
+        )
         await _seed_card(isolated_db, job_id="j2", resume_id="r2", status="applied")
         async with _client() as client:
             resp = await client.get("/api/v1/applications")
@@ -210,11 +221,13 @@ class TestRobustnessFixes:
         assert "bogus_status" not in columns
         assert len(columns["applied"]) == 1  # the valid card still renders
 
-    async def test_manual_add_cleans_up_orphan_job_on_failure(self, isolated_db):
+    async def test_manual_add_cleans_up_orphan_job_on_failure(
+        self, isolated_db: Database
+    ) -> None:
         """If application creation fails, the just-created job is removed."""
         with patch.object(
             isolated_db,
-            "create_application",
+            "_insert_application",
             new_callable=AsyncMock,
             side_effect=RuntimeError("boom"),
         ):

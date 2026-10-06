@@ -5,7 +5,16 @@ import type {
 import type { ResumeData } from '@/components/dashboard/resume-component';
 import { type TemplateSettings } from '@/lib/types/template-settings';
 import { type Locale } from '@/i18n/config';
-import { API_BASE, DEFAULT_TIMEOUT_MS, apiPost, apiPatch, apiDelete, apiFetch } from './client';
+import { clearResumeWizardCompletion } from '@/lib/utils/resume-wizard-storage';
+import {
+  API_BASE,
+  DEFAULT_TIMEOUT_MS,
+  apiPost,
+  apiPatch,
+  apiDelete,
+  apiFetch,
+  parseErrorDetail,
+} from './client';
 
 // Matches backend schemas/models.py ResumeData
 interface ProcessedResume {
@@ -54,6 +63,66 @@ interface ProcessedResume {
   };
 }
 
+/** Maximum number of master resumes; keep in sync with backend app/database.py. */
+export const MAX_MASTER_RESUMES = 5;
+
+/** Template settings sent with a preview so the backend can fit bullets to one page. */
+export interface PageFitSettings {
+  template: string;
+  pageSize: 'A4' | 'LETTER';
+  marginTop: number;
+  marginBottom: number;
+  marginLeft: number;
+  marginRight: number;
+  sectionSpacing: number;
+  itemSpacing: number;
+  lineHeight: number;
+  fontSize: number;
+  headerScale: number;
+  headerFont: string;
+  bodyFont: string;
+  compactMode: boolean;
+  showContactIcons: boolean;
+  accentColor: string;
+  lang?: string;
+}
+
+/** Summary of harness-steered bullet selection returned by improve/preview. */
+export interface BulletSelectionSummary {
+  max_per_entry: number;
+  bullets_before: number;
+  bullets_after: number;
+  trimmed_for_fit: number;
+  scoring: 'llm' | 'keyword_fallback';
+  page_fit: 'fits' | 'trimmed' | 'over' | 'unavailable' | 'skipped';
+  final_pages: number | null;
+  /** Re-render of the rewritten result: 'skipped' means final_pages predates the rewrite. */
+  final_check?: 'ok' | 'skipped' | null;
+}
+
+/** Maps builder template settings onto the PDF/page-fit parameter names. */
+export function toPageFitSettings(settings: TemplateSettings, locale?: string): PageFitSettings {
+  return {
+    template: settings.template,
+    pageSize: settings.pageSize,
+    marginTop: settings.margins.top,
+    marginBottom: settings.margins.bottom,
+    marginLeft: settings.margins.left,
+    marginRight: settings.margins.right,
+    sectionSpacing: settings.spacing.section,
+    itemSpacing: settings.spacing.item,
+    lineHeight: settings.spacing.lineHeight,
+    fontSize: settings.fontSize.base,
+    headerScale: settings.fontSize.headerScale,
+    headerFont: settings.fontSize.headerFont,
+    bodyFont: settings.fontSize.bodyFont,
+    compactMode: settings.compactMode,
+    showContactIcons: settings.showContactIcons,
+    accentColor: settings.accentColor,
+    ...(locale ? { lang: locale } : {}),
+  };
+}
+
 interface ResumeResponse {
   request_id: string;
   data: {
@@ -71,6 +140,8 @@ interface ResumeResponse {
     interview_prep?: InterviewPrepData | null;
     parent_id?: string | null; // For determining if resume is tailored
     title?: string | null;
+    is_master?: boolean;
+    is_default_master?: boolean;
   };
 }
 
@@ -81,11 +152,13 @@ export interface ResumeUploadResponse {
   resume_id: string;
   processing_status: 'pending' | 'processing' | 'ready' | 'failed';
   is_master: boolean;
+  is_default_master?: boolean;
 }
 
 interface ImproveResumeConfirmRequest {
   resume_id: string;
   job_id: string;
+  preview_id?: string | null;
   improved_data: ResumeData;
   improvements: Array<{
     suggestion: string;
@@ -105,6 +178,7 @@ export interface ResumeListItem {
   resume_id: string;
   filename: string | null;
   is_master: boolean;
+  is_default_master?: boolean;
   parent_id: string | null;
   processing_status: 'pending' | 'processing' | 'ready' | 'failed';
   created_at: string;
@@ -173,12 +247,17 @@ export async function improveResume(
 export async function previewImproveResume(
   resumeId: string,
   jobId: string,
-  promptId?: string
+  promptId?: string,
+  options?: { maxBulletsPerEntry?: number; pageFit?: PageFitSettings }
 ): Promise<ImprovedResult> {
   return postImprove('/resumes/improve/preview', {
     resume_id: resumeId,
     job_id: jobId,
     prompt_id: promptId ?? null,
+    ...(options?.maxBulletsPerEntry !== undefined
+      ? { max_bullets_per_entry: options.maxBulletsPerEntry }
+      : {}),
+    ...(options?.pageFit !== undefined ? { page_fit: options.pageFit } : {}),
   });
 }
 
@@ -280,6 +359,7 @@ export async function deleteResume(resumeId: string): Promise<void> {
     const text = await res.text().catch(() => '');
     throw new Error(`Failed to delete resume (status ${res.status}): ${text}`);
   }
+  clearResumeWizardCompletion(resumeId);
 }
 
 /** Updates the cover letter for a resume */
@@ -309,6 +389,55 @@ export async function renameResume(resumeId: string, title: string): Promise<voi
     const text = await res.text().catch(() => '');
     throw new Error(`Failed to rename resume (status ${res.status}): ${text}`);
   }
+}
+
+/** Marks a master resume as the default one used for tailoring */
+export async function setDefaultMasterResume(
+  resumeId: string
+): Promise<{ resume_id: string; is_default_master: boolean }> {
+  const normalizedId = normalizeResumeId(resumeId);
+  const res = await apiPost(`/resumes/${encodeURIComponent(normalizedId)}/default`, {});
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Failed to set default master resume (status ${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+/** Result of duplicating a resume: the copy is a new resume with its own id. */
+export interface DuplicateResumeResponse {
+  resume_id: string;
+  title: string;
+  is_master: boolean;
+  is_default_master: boolean;
+  parent_id: string | null;
+}
+
+/** A failed duplicate request. `message` is the server's own text for a 409. */
+export class DuplicateResumeError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = 'DuplicateResumeError';
+  }
+}
+
+/** Copies a whole resume (content, template settings, track title) into a new resume */
+export async function duplicateResume(resumeId: string): Promise<DuplicateResumeResponse> {
+  const normalizedId = normalizeResumeId(resumeId);
+  const res = await apiPost(`/resumes/${encodeURIComponent(normalizedId)}/duplicate`, {});
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    // A 409 (not ready yet, or master limit reached) carries a user-facing reason in `detail`.
+    const detail = res.status === 409 ? parseErrorDetail(text) : null;
+    throw new DuplicateResumeError(
+      detail ?? `Failed to duplicate resume (status ${res.status}): ${text}`,
+      res.status
+    );
+  }
+  return res.json();
 }
 
 /** Downloads cover letter as PDF */
@@ -373,8 +502,15 @@ export async function generateInterviewPrep(resumeId: string): Promise<Interview
 }
 
 /** Retries AI processing for a failed resume */
-export async function retryProcessing(resumeId: string): Promise<ResumeUploadResponse> {
+export async function retryProcessing(
+  resumeId: string
+): Promise<Pick<ResumeUploadResponse, 'resume_id' | 'processing_status'>> {
   const res = await apiPost(`/resumes/${encodeURIComponent(resumeId)}/retry-processing`, {});
+  if (res.status === 409) {
+    // Another attempt owns the row. Observe it instead of labeling it failed.
+    const current = await fetchResume(resumeId);
+    return { resume_id: resumeId, processing_status: current.raw_resume.processing_status };
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`Failed to retry processing (status ${res.status}): ${text}`);

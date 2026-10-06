@@ -12,7 +12,6 @@ from app.llm import (
 from app.prompts import INTERVIEW_PREP_PROMPT, get_language_name
 from app.schemas import InterviewPrepData
 
-
 _JOB_DESCRIPTION_PROMPT_CHAR_LIMIT = 12_000
 _RESUME_DATA_PROMPT_CHAR_LIMIT = 30_000
 _TRUNCATION_NOTICE = (
@@ -113,7 +112,11 @@ async def generate_interview_prep(
         output_language=get_language_name(language),
     )
     config = get_llm_config()
-    max_tokens = get_safe_max_tokens(get_model_name(config), requested=8192)
+    max_tokens = get_safe_max_tokens(
+        get_model_name(config),
+        requested=8192,
+        config=config,
+    )
 
     result = await complete_json(
         prompt=prompt,
