@@ -984,10 +984,18 @@ async def upload_resume(
         raise
     except Exception:
         logger.exception("Document parsing failed")
-        raise HTTPException(
-            status_code=422,
-            detail="Failed to parse document. Please upload a valid PDF, DOC, or DOCX file.",
-        )
+        # The strict PDF preflight rejects files that other readers open (a missing object in the
+        # xref table, an unusual stream filter), and a rejected PDF never reaches text extraction.
+        # pdfium repairs most of them, so try the page images before giving up.
+        ocr_text = ""
+        if (file.filename or "").lower().endswith(".pdf"):
+            ocr_text = await ocr_pdf(content)
+        if not ocr_text or needs_ocr(ocr_text):
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to parse document. Please upload a valid PDF, DOC, or DOCX file.",
+            )
+        markdown_content = ocr_text
 
     # Scanned PDF (empty or junk text layer): transcribe the page images; if that fails the 422 below stands.
     if (file.filename or "").lower().endswith(".pdf") and needs_ocr(markdown_content):
