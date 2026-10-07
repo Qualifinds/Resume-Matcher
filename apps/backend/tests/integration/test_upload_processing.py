@@ -303,6 +303,83 @@ async def test_upload_text_pdf_never_calls_ocr(
     ocr.assert_not_awaited()
 
 
+async def test_upload_pdf_rejected_by_preflight_falls_back_to_ocr(
+    client: AsyncClient, isolated_db: Database, sample_resume: dict[str, object]
+) -> None:
+    """A PDF the strict validator rejects (missing object, odd filter) is read as page images."""
+    transcription = "Jane Doe " + "Senior engineer at Acme building payment systems. " * 10
+    with (
+        patch(
+            "app.routers.resumes.parse_document",
+            new_callable=AsyncMock,
+            side_effect=ValueError("Unsupported PDF stream filter"),
+        ),
+        patch(
+            "app.routers.resumes.parse_resume_to_json",
+            new_callable=AsyncMock,
+            return_value=sample_resume,
+        ) as parse_json,
+        patch(
+            "app.routers.resumes.ocr_pdf", new_callable=AsyncMock, return_value=transcription
+        ) as ocr,
+    ):
+        async with client:
+            response = await client.post(
+                "/api/v1/resumes/upload",
+                files={"file": ("odd.pdf", _pdf_bytes(), "application/pdf")},
+            )
+
+    assert response.status_code == 200
+    ocr.assert_awaited_once()
+    assert parse_json.await_args.args[0] == transcription
+    assert len(await isolated_db.list_resumes()) == 1
+
+
+async def test_upload_rejected_pdf_without_ocr_text_stays_422(
+    client: AsyncClient, isolated_db: Database
+) -> None:
+    with (
+        patch(
+            "app.routers.resumes.parse_document",
+            new_callable=AsyncMock,
+            side_effect=ValueError("PDFObjectNotFound"),
+        ),
+        patch("app.routers.resumes.ocr_pdf", new_callable=AsyncMock, return_value=""),
+    ):
+        async with client:
+            response = await client.post(
+                "/api/v1/resumes/upload",
+                files={"file": ("broken.pdf", _pdf_bytes(), "application/pdf")},
+            )
+    assert response.status_code == 422
+    assert "Failed to parse document" in response.json()["detail"]
+    assert await isolated_db.list_resumes() == []
+
+
+async def test_upload_rejected_docx_never_tries_ocr(client: AsyncClient) -> None:
+    with (
+        patch(
+            "app.routers.resumes.parse_document",
+            new_callable=AsyncMock,
+            side_effect=ValueError("bad docx"),
+        ),
+        patch("app.routers.resumes.ocr_pdf", new_callable=AsyncMock) as ocr,
+    ):
+        async with client:
+            response = await client.post(
+                "/api/v1/resumes/upload",
+                files={
+                    "file": (
+                        "x.docx",
+                        _docx_bytes("hello"),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+            )
+    assert response.status_code == 422
+    ocr.assert_not_awaited()
+
+
 async def test_upload_rejects_extracted_text_over_prompt_limit(
     client: AsyncClient, isolated_db: Database, sample_resume: dict[str, object]
 ) -> None:
