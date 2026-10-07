@@ -765,7 +765,7 @@ DOCUMENT_TYPES_BY_EXTENSION = {
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
-MAX_FILE_SIZE = 4 * 1024 * 1024  # 4MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB (the Qualifinds platform accepts CVs up to 10MB)
 UPLOAD_READ_CHUNK_SIZE = 64 * 1024
 MASTER_LIMIT_DETAIL = (
     "You can keep up to 5 master resumes. Delete one before adding another."
