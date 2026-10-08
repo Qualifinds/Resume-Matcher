@@ -30,6 +30,7 @@ from app.database import (
     ProcessingFinishOutcome,
     ResumeNotFoundError,
     db,
+    max_master_resumes,
 )
 from app.pdf import PDFRenderError, render_resume_pdf
 from app.preview import (
@@ -765,11 +766,17 @@ DOCUMENT_TYPES_BY_EXTENSION = {
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB (the Qualifinds platform accepts CVs up to 10MB)
+MAX_FILE_SIZE = (
+    10 * 1024 * 1024
+)  # 10MB (the Qualifinds platform accepts CVs up to 10MB)
 UPLOAD_READ_CHUNK_SIZE = 64 * 1024
-MASTER_LIMIT_DETAIL = (
-    "You can keep up to 5 master resumes. Delete one before adding another."
-)
+
+
+def _master_limit_detail() -> str:
+    return (
+        f"You can keep up to {max_master_resumes()} master resumes. "
+        "Delete one before adding another."
+    )
 
 
 def _validate_upload_type(file: UploadFile) -> None:
@@ -1029,7 +1036,7 @@ async def upload_resume(
         )
     except MasterResumeLimitError as e:
         logger.info("Upload rejected: %s", e)
-        raise HTTPException(status_code=409, detail=MASTER_LIMIT_DETAIL) from e
+        raise HTTPException(status_code=409, detail=_master_limit_detail()) from e
 
     # Preserve acknowledgement of this request's committed insert even if its
     # parse fails or the outer operation timer cancels the handler. A status
@@ -2161,7 +2168,9 @@ async def download_resume_pdf(
         raise HTTPException(status_code=503, detail=str(e))
 
     suffix = "_client" if variant == "client" else ""
-    headers = {"Content-Disposition": f'attachment; filename="resume_{resume_id}{suffix}.pdf"'}
+    headers = {
+        "Content-Disposition": f'attachment; filename="resume_{resume_id}{suffix}.pdf"'
+    }
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 
@@ -2386,7 +2395,7 @@ async def duplicate_resume(resume_id: str) -> DuplicateResumeResponse:
                 )
     except MasterResumeLimitError as e:
         logger.info("Duplicate rejected: %s", e)
-        raise HTTPException(status_code=409, detail=MASTER_LIMIT_DETAIL) from e
+        raise HTTPException(status_code=409, detail=_master_limit_detail()) from e
     except DatabaseBusyError:
         raise
     except Exception as e:

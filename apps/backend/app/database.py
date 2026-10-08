@@ -56,8 +56,15 @@ APPLICATION_STATUSES: tuple[str, ...] = (
 )
 ProcessingFinishOutcome = Literal["committed", "stale", "missing"]
 
-# A user keeps at most this many master resumes (career tracks).
+# A user keeps at most this many master resumes (career tracks). Default for the single-user UI;
+# deployments used as an automated parsing API (upload -> read -> delete, several clients at once)
+# raise it with MAX_MASTER_RESUMES, because every in-flight upload is a master until deleted.
 MAX_MASTER_RESUMES = 5
+
+
+def max_master_resumes() -> int:
+    """Effective limit: settings.max_master_resumes (env MAX_MASTER_RESUMES), default 5."""
+    return settings.max_master_resumes
 
 
 class DatabaseBusyError(RuntimeError):
@@ -341,10 +348,9 @@ class Database:
                     existing = self._resume_to_dict(master)
                     if replay_if(existing):
                         return existing
-            if len(masters) >= MAX_MASTER_RESUMES:
-                raise MasterResumeLimitError(
-                    f"Master resume limit reached ({MAX_MASTER_RESUMES})"
-                )
+            limit = max_master_resumes()
+            if len(masters) >= limit:
+                raise MasterResumeLimitError(f"Master resume limit reached ({limit})")
             current_default = next((m for m in masters if m.is_default_master), None)
             is_default = current_default is None
             if (

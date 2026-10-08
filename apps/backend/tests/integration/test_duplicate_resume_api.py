@@ -9,7 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.database import MAX_MASTER_RESUMES, Database, DatabaseBusyError
 from app.main import app
-from app.routers.resumes import MASTER_LIMIT_DETAIL, _copy_title
+from app.routers.resumes import _copy_title, _master_limit_detail
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ async def test_duplicate_master_rejected_at_limit(
     res = await client.post(f"/api/v1/resumes/{first['resume_id']}/duplicate")
 
     assert res.status_code == 409
-    assert res.json()["detail"] == MASTER_LIMIT_DETAIL
+    assert res.json()["detail"] == _master_limit_detail()
     assert (
         res.json()["detail"]
         == "You can keep up to 5 master resumes. Delete one before adding another."
