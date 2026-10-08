@@ -39,6 +39,7 @@ from pdfminer.pdftypes import (
 )
 from pdfminer.psparser import PSKeyword, literal_name
 
+from app.config import settings
 from app.llm import complete_json, get_llm_config, get_model_name, get_safe_max_tokens
 from app.prompts import PARSE_RESUME_PROMPT
 from app.prompts.templates import RESUME_SCHEMA_EXAMPLE
@@ -53,7 +54,10 @@ MAX_EXTRACTED_TEXT_BYTES = 2 * 1024 * 1024
 # Decoder row buffers can allocate from dimensions before consuming input.
 MAX_PDF_SCANLINE_COLUMNS = 32_768
 MAX_PDF_SCANLINE_BYTES = 256 * 1024
-DOCUMENT_CONVERSION_WORKERS = 2
+# Conversions run in threads that cannot be killed: one that outlives its deadline keeps its slot
+# until it ends. With only 2 slots, two pathological PDFs stall every upload behind them (seen in
+# production on 2026-10-08 under the compact-cvs backfill). DOCUMENT_CONVERSION_WORKERS raises it.
+DOCUMENT_CONVERSION_WORKERS = settings.document_conversion_workers
 DOCUMENT_CONVERSION_TIMEOUT_SECONDS = 120.0
 _DOCUMENT_BACKGROUND_WORKERS: set[asyncio.Task[str]] = set()
 _DOCUMENT_CONVERSION_LIMITER = anyio.CapacityLimiter(DOCUMENT_CONVERSION_WORKERS)
@@ -798,9 +802,23 @@ async def parse_document(content: bytes, filename: str) -> str:
         # Threads cannot be killed safely. Return on the caller's deadline while
         # the worker retains its limiter slot and owns its tempfile until done.
         _DOCUMENT_BACKGROUND_WORKERS.add(worker)
+        started = deadline - DOCUMENT_CONVERSION_TIMEOUT_SECONDS
+        logger.warning(
+            "Document conversion still running past its deadline: %s (%d bytes); "
+            "%d of %d conversion slots held by overdue conversions",
+            filename,
+            len(content),
+            len(_DOCUMENT_BACKGROUND_WORKERS),
+            DOCUMENT_CONVERSION_WORKERS,
+        )
 
         def consume_result(done: asyncio.Task[str]) -> None:
             _DOCUMENT_BACKGROUND_WORKERS.discard(done)
+            logger.warning(
+                "Overdue document conversion released its slot after %.0fs: %s",
+                asyncio.get_running_loop().time() - started,
+                filename,
+            )
             if not done.cancelled():
                 try:
                     done.result()

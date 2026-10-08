@@ -539,3 +539,50 @@ async def test_cancelled_queued_conversion_never_starts_later(
     await asyncio.gather(*owners)
     await asyncio.sleep(0.05)
     assert calls == 2
+
+
+def test_conversion_slots_follow_settings() -> None:
+    from app.config import settings
+    from app.services import parser
+
+    assert parser.DOCUMENT_CONVERSION_WORKERS == settings.document_conversion_workers
+    assert (
+        parser._DOCUMENT_CONVERSION_LIMITER.total_tokens
+        == settings.document_conversion_workers
+    )
+
+
+async def test_overdue_conversion_is_logged_with_its_file(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An overdue conversion keeps its slot; the log must say which file and how many are held."""
+    import logging
+
+    from app.services import parser
+
+    monkeypatch.setattr(
+        parser, "DOCUMENT_CONVERSION_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stuck_convert(content: bytes, filename: str) -> str:
+        entered.set()
+        release.wait(2)
+        return "done"
+
+    monkeypatch.setattr(parser, "_parse_document_sync", stuck_convert)
+    caplog.set_level(logging.WARNING, logger="app.services.parser")
+    task = asyncio.create_task(parser.parse_document(b"x", "slow-cv.pdf"))
+    assert await asyncio.to_thread(entered.wait, 1)
+    try:
+        with pytest.raises(TimeoutError):
+            await task
+        assert "still running past its deadline: slow-cv.pdf" in caplog.text
+    finally:
+        release.set()
+        for _ in range(50):
+            if "released its slot" in caplog.text:
+                break
+            await asyncio.sleep(0.02)
+    assert "released its slot" in caplog.text
