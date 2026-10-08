@@ -246,3 +246,17 @@ async def test_render_draft_endpoint_serves_and_404s(client: AsyncClient) -> Non
     assert (
         await client.get("/api/v1/resumes/render-drafts/" + "0" * 32)
     ).status_code == 404
+
+
+async def test_master_limit_is_configurable(
+    isolated_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment used as a parsing API raises MAX_MASTER_RESUMES; the limit follows settings."""
+    from app.config import settings
+    from app.database import MasterResumeLimitError
+
+    monkeypatch.setattr(settings, "max_master_resumes", 7)
+    for i in range(7):
+        await _master(isolated_db, f"m{i}")
+    with pytest.raises(MasterResumeLimitError, match=r"\(7\)"):
+        await _master(isolated_db, "m7")

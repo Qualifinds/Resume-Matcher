@@ -313,6 +313,9 @@ class Settings(BaseSettings):
     ocr_max_pages: int = Field(default=4, ge=1, le=10)
     ocr_min_chars: int = Field(default=200, ge=0)
     ocr_timeout_seconds: float = Field(default=75.0, ge=5, le=110)
+    # Master resumes (career tracks) a deployment keeps at once; see app/database.py
+    max_master_resumes: int = Field(default=5, ge=1, le=1000)
+
     # Max wait for the process-wide pdfium lock, and the render budget (see app/services/ocr.py)
     ocr_render_timeout_seconds: float = Field(default=30.0, ge=1, le=110)
 
