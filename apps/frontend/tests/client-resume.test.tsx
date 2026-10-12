@@ -17,7 +17,8 @@ const data = {
     linkedin: 'linkedin.com/in/ana-perez',
     github: 'github.com/anaperez',
   },
-  summary: 'Engineer with 8 years of experience. Reach me at ana.perez@example.com or 55 1191 2660.',
+  summary:
+    'Engineer with 8 years of experience. Reach me at ana.perez@example.com or 55 1191 2660.',
   workExperience: [
     {
       id: 1,
@@ -25,7 +26,10 @@ const data = {
       company: 'Bimbo',
       location: 'Monterrey, México',
       years: '01-2019 - 03-2021',
-      description: ['Led a team of 8 engineers.', 'See https://bimbo.example.com/ana for the case study.'],
+      description: [
+        'Led a team of 8 engineers.',
+        'See https://bimbo.example.com/ana for the case study.',
+      ],
     },
   ],
   education: [{ id: 1, institution: 'UANL', degree: 'BSc Computer Science', years: '2012-2016' }],
@@ -54,13 +58,17 @@ describe('scrubContactText', () => {
     expect(scrubContactText('Tel 55 1191 2660')).not.toMatch(/\d{4}/);
     expect(scrubContactText('Bimbo (2019-2021)')).toBe('Bimbo (2019-2021)');
     expect(scrubContactText('Bimbo (01-2019 - 03-2021)')).toBe('Bimbo (01-2019 - 03-2021)');
-    expect(scrubContactText('Led 8 engineers; cut costs by 40%.')).toBe('Led 8 engineers; cut costs by 40%.');
+    expect(scrubContactText('Led 8 engineers; cut costs by 40%.')).toBe(
+      'Led 8 engineers; cut costs by 40%.'
+    );
   });
 });
 
 describe('cityCountryOnly', () => {
   it('drops street, number and neighbourhood', () => {
-    expect(cityCountryOnly('Calle 5 #123, Col. Centro, Monterrey, NL, México')).toBe('Monterrey, NL, México');
+    expect(cityCountryOnly('Calle 5 #123, Col. Centro, Monterrey, NL, México')).toBe(
+      'Monterrey, NL, México'
+    );
     expect(cityCountryOnly('Av. Insurgentes Sur 1234, CDMX, México')).toBe('CDMX, México');
     expect(cityCountryOnly('Monterrey, México')).toBe('Monterrey, México');
     expect(cityCountryOnly('64000')).toBeUndefined();
@@ -113,5 +121,24 @@ describe.each(TEMPLATES)('client variant renders no contact info — %s', (templ
     expect(html).not.toMatch(/1191|2660/);
     expect(html).not.toMatch(/mailto:|tel:/i);
     expect(html).not.toMatch(/href=/i);
+  });
+});
+
+// The client variant drops email and phone; templates used to print ", " before every field after
+// email, which left ", Monterrey, NL, México" (seen in production on 2026-10-12).
+describe.each(TEMPLATES)('client variant has no leading separator — %s', (template) => {
+  it('the row holding the location does not start with a comma', () => {
+    const { getAllByText } = render(
+      <Resume resumeData={toClientResume(data)} template={template} />
+    );
+    for (const node of getAllByText(/Monterrey, NL, México/)) {
+      const row = node.closest('div') ?? node;
+      expect(row.textContent?.trim().startsWith(',')).toBe(false);
+    }
+  });
+
+  it('keeps a comma between fields when several are present', () => {
+    const { container } = render(<Resume resumeData={data} template={template} />);
+    expect(container.textContent).toContain('ana.perez@example.com');
   });
 });

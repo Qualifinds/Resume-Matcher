@@ -165,37 +165,23 @@ export const ResumeTwoColumn: React.FC<ResumeTwoColumnProps> = ({
           <div
             className={`flex flex-wrap justify-center gap-x-1 gap-y-1 ${baseStyles['resume-meta']}`}
           >
-            {personalInfo.email && renderContactDetail('Email', personalInfo.email, 'mailto:')}
-            {personalInfo.phone && (
-              <>
-                <span className={baseStyles['text-muted']}>,</span>
-                {renderContactDetail('Phone', personalInfo.phone, 'tel:')}
-              </>
-            )}
-            {personalInfo.location && (
-              <>
-                <span className={baseStyles['text-muted']}>,</span>
-                {renderContactDetail('Location', personalInfo.location)}
-              </>
-            )}
-            {personalInfo.website && (
-              <>
-                <span className={baseStyles['text-muted']}>,</span>
-                {renderContactDetail('Website', personalInfo.website)}
-              </>
-            )}
-            {personalInfo.linkedin && (
-              <>
-                <span className={baseStyles['text-muted']}>,</span>
-                {renderContactDetail('LinkedIn', personalInfo.linkedin)}
-              </>
-            )}
-            {personalInfo.github && (
-              <>
-                <span className={baseStyles['text-muted']}>,</span>
-                {renderContactDetail('GitHub', personalInfo.github)}
-              </>
-            )}
+            {[
+              renderContactDetail('Email', personalInfo.email, 'mailto:'),
+              renderContactDetail('Phone', personalInfo.phone, 'tel:'),
+              renderContactDetail('Location', personalInfo.location),
+              renderContactDetail('Website', personalInfo.website),
+              renderContactDetail('LinkedIn', personalInfo.linkedin),
+              renderContactDetail('GitHub', personalInfo.github),
+            ]
+              // Comma only BETWEEN the items present: the client variant (lib/client-resume.ts)
+              // drops email and phone, and a fixed ", " before each field left ", Ciudad de México".
+              .filter(Boolean)
+              .map((item, index) => (
+                <React.Fragment key={index}>
+                  {index > 0 && <span className={baseStyles['text-muted']}>,</span>}
+                  {item}
+                </React.Fragment>
+              ))}
           </div>
         </header>
       )}
