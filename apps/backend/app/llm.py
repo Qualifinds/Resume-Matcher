@@ -1036,6 +1036,8 @@ async def complete(
 
 def supports_vision(config: LLMConfig | None = None) -> bool:
     """Whether the configured model accepts images (LiteLLM registry; Ollama is assumed capable)."""
+    if settings.llm_supports_vision is not None:
+        return settings.llm_supports_vision
     config = config or get_llm_config()
     model_name = get_model_name(config)
     if model_name.startswith(("ollama/", "ollama_chat/")):
@@ -1062,7 +1064,12 @@ async def complete_vision(
     parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for png in images:
         encoded = base64.b64encode(png).decode("ascii")
-        parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{encoded}"},
+            }
+        )
     messages: list[dict[str, Any]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -1074,7 +1081,9 @@ async def complete_vision(
             messages=messages,
             max_tokens=max_tokens,
             temperature=0,
-            timeout=remaining_timeout(_calculate_timeout("completion", max_tokens, config.provider)),
+            timeout=remaining_timeout(
+                _calculate_timeout("completion", max_tokens, config.provider)
+            ),
         )
         content = _extract_choice_text(response.choices[0])
         if not content or not content.strip():
