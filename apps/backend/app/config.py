@@ -310,6 +310,10 @@ class Settings(BaseSettings):
 
     # OCR fallback for scanned PDFs (vision call to the same LLM; see app/services/ocr.py)
     ocr_enabled: bool = True
+    # Whether the LLM accepts images, when LiteLLM's registry doesn't know the model. None = ask the
+    # registry. OpenRouter models newer than the pinned LiteLLM (e.g. openai/gpt-5.6-luna, which does
+    # take images) read as "no vision" there, and every scanned PDF silently skipped OCR (422).
+    llm_supports_vision: bool | None = None
     ocr_max_pages: int = Field(default=4, ge=1, le=10)
     ocr_min_chars: int = Field(default=200, ge=0)
     ocr_timeout_seconds: float = Field(default=75.0, ge=5, le=110)

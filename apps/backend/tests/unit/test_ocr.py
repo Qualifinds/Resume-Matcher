@@ -161,3 +161,18 @@ def test_render_keeps_full_scale_for_letter_pages() -> None:
 
     (png,) = ocr.render_pdf_pages(_pdf_with_page(612, 792), max_pages=1)
     assert Image.open(io.BytesIO(png)).size == (1224, 1584)
+
+
+def test_vision_override_wins_over_litellm_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model LiteLLM doesn't know (newer OpenRouter ids) can be declared vision-capable."""
+    from app import llm
+
+    monkeypatch.setattr(llm.litellm, "supports_vision", lambda model: False)
+    monkeypatch.setattr(settings, "llm_supports_vision", True)
+    assert llm.supports_vision() is True
+    monkeypatch.setattr(settings, "llm_supports_vision", False)
+    assert llm.supports_vision() is False
+    monkeypatch.setattr(settings, "llm_supports_vision", None)
+    assert llm.supports_vision() is False
