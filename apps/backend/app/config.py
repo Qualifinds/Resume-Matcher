@@ -313,6 +313,9 @@ class Settings(BaseSettings):
     ocr_max_pages: int = Field(default=4, ge=1, le=10)
     ocr_min_chars: int = Field(default=200, ge=0)
     ocr_timeout_seconds: float = Field(default=75.0, ge=5, le=110)
+    # Document conversions (markitdown) allowed at once, process-wide; see app/services/parser.py
+    document_conversion_workers: int = Field(default=2, ge=1, le=32)
+
     # Master resumes (career tracks) a deployment keeps at once; see app/database.py
     max_master_resumes: int = Field(default=5, ge=1, le=1000)
 
