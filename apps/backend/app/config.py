@@ -323,6 +323,11 @@ class Settings(BaseSettings):
     # Master resumes (career tracks) a deployment keeps at once; see app/database.py
     max_master_resumes: int = Field(default=5, ge=1, le=1000)
 
+    # How long a SQLite writer waits for the write lock before the request answers
+    # 503 "Database is busy" (PRAGMA busy_timeout; see app/db_engine.py). Under load the
+    # writes queue behind each other and 5s was not enough (2026-10-13, Qualifinds).
+    sqlite_busy_timeout_ms: int = Field(default=5000, ge=100, le=120000)
+
     # Max wait for the process-wide pdfium lock, and the render budget (see app/services/ocr.py)
     ocr_render_timeout_seconds: float = Field(default=30.0, ge=1, le=110)
 
