@@ -218,11 +218,30 @@
 /* Individual item within a section */
 .resume-item {
   margin-bottom: var(--item-gap);
-  /* Prevent items from splitting across pages/columns in PDF and print output */
+  /*
+   * An item MAY span pages. Keeping a whole job entry together pushed any entry taller than
+   * the rest of the page onto the next one and left the page above mostly blank (a 50-line
+   * first job left page 1 with only the header and the summary). What must stay whole is
+   * the item's heading and each bullet — see the two rules below.
+   */
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+/* Heading rows (title/date, company/location): never split, never orphaned at the foot of a
+   page — they travel with the first line that follows them. Children holding a list are
+   left splittable so a long description can continue on the next page. */
+.resume-item > :not(ul):not(:has(ul)) {
   break-inside: avoid;
   page-break-inside: avoid;
-  -webkit-column-break-inside: avoid;
-  -moz-column-break-inside: avoid;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* A single bullet never splits across pages. */
+.resume-item li {
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .resume-item:last-child {
@@ -282,8 +301,15 @@
     break-inside: avoid-page !important;
   }
 
-  /* Avoid breaking individual resume items across pages */
-  .resume-item {
+  /* Items may span pages; their heading rows and each bullet stay whole (see above) */
+  .resume-item > :not(ul):not(:has(ul)) {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    break-after: avoid !important;
+    page-break-after: avoid !important;
+  }
+
+  .resume-item li {
     break-inside: avoid !important;
     page-break-inside: avoid !important;
   }
