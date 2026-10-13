@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from app.config import settings
 from app.models import Base
 
 __all__ = ["Base", "make_async_engine", "make_sync_engine", "init_models_sync"]
@@ -24,13 +25,14 @@ def _apply_sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> Non
     WAL improves concurrent read/write between the async (doc tables) and sync
     (api_keys) engines pointed at the same file; ``busy_timeout`` rides out the
     brief lock contention that creates; ``foreign_keys`` enforces relational
-    integrity (off by default in SQLite).
+    integrity (off by default in SQLite). The timeout comes from
+    ``SQLITE_BUSY_TIMEOUT_MS`` (default 5000).
     """
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute(f"PRAGMA busy_timeout={int(settings.sqlite_busy_timeout_ms)}")
     finally:
         cursor.close()
 
