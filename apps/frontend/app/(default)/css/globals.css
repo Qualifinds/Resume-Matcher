@@ -193,14 +193,20 @@
 
 /* ============================================
    PAGE BREAK CONTROL
-   Prevents individual items from being split
-   across pages during PDF generation.
-   NOTE: Sections CAN span pages - only individual
-   items (job entries, project entries) stay together.
+   Sections and items CAN span pages; only an
+   item's heading rows and each bullet stay together.
    ============================================ */
 
-/* Individual items should stay together (job entries, projects, etc.) */
-.resume-body .resume-item {
+/* Items may span pages (a job taller than the rest of the page used to leave it blank);
+   their heading rows and each bullet stay whole. Mirrors _base.module.css. */
+.resume-body .resume-item > :not(ul):not(:has(ul)) {
+  break-inside: avoid;
+  page-break-inside: avoid;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+.resume-body .resume-item li {
   break-inside: avoid;
   page-break-inside: avoid;
 }
@@ -252,8 +258,15 @@
     page-break-after: avoid !important;
   }
 
-  /* Reinforce page break rules in print - only for individual items */
-  .resume-body .resume-item {
+  /* Reinforce page break rules in print - heading rows and bullets only */
+  .resume-body .resume-item > :not(ul):not(:has(ul)) {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    break-after: avoid !important;
+    page-break-after: avoid !important;
+  }
+
+  .resume-body .resume-item li {
     break-inside: avoid !important;
     page-break-inside: avoid !important;
   }
