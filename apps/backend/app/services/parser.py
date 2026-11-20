@@ -1,45 +1,28 @@
-"""Document parsing service using markitdown and LLM."""
+"""Document parsing service using markitdown and LLM.
 
-import array
+The PDF/DOC/DOCX validation and conversion lives in ``app.document_conversion`` and runs in a child
+process (see ``parse_document``); this module owns the slots, the deadline and the LLM parsing.
+"""
+
 import asyncio
-import io
+import json
 import logging
 import re
+import shutil
+import sys
 import tempfile
-import zipfile
-import zlib
 from pathlib import Path
-from typing import Any, BinaryIO, Sequence
+from typing import Any
 
 import anyio
-from markitdown import MarkItDown
-from pdfminer.ascii85 import ascii85decode, asciihexdecode
-from pdfminer.ccitt import CCITTFaxDecoder
-from pdfminer.lzw import LZWDecoder
-from pdfminer.pdfdevice import PDFDevice
-from pdfminer.pdfdocument import PDFDocument
-from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
-from pdfminer.pdfpage import PDFPage
-from pdfminer.pdfparser import PDFParser
-from pdfminer.pdftypes import (
-    LITERAL_CRYPT,
-    LITERALS_ASCII85_DECODE,
-    LITERALS_ASCIIHEX_DECODE,
-    LITERALS_CCITTFAX_DECODE,
-    LITERALS_DCT_DECODE,
-    LITERALS_FLATE_DECODE,
-    LITERALS_JBIG2_DECODE,
-    LITERALS_JPX_DECODE,
-    LITERALS_LZW_DECODE,
-    LITERALS_RUNLENGTH_DECODE,
-    PDFStream,
-    apply_png_predictor,
-    apply_tiff_predictor,
-    int_value,
-)
-from pdfminer.psparser import PSKeyword, literal_name
 
 from app.config import settings
+from app.document_conversion import (  # noqa: F401  (re-exported for routers and tests)
+    MAX_EXTRACTED_TEXT_BYTES,
+    MAX_UNPACKED_DOCUMENT_BYTES,
+    DocumentResourceLimitError,
+    DocumentValidationError,
+)
 from app.llm import complete_json, get_llm_config, get_model_name, get_safe_max_tokens
 from app.prompts import PARSE_RESUME_PROMPT
 from app.prompts.templates import RESUME_SCHEMA_EXAMPLE
@@ -47,427 +30,28 @@ from app.schemas import ResumeData
 
 logger = logging.getLogger(__name__)
 
-DOCUMENT_IO_CHUNK_SIZE = 64 * 1024
-MAX_DOCX_MEMBERS = 1_024
-MAX_UNPACKED_DOCUMENT_BYTES = 16 * 1024 * 1024
-MAX_EXTRACTED_TEXT_BYTES = 2 * 1024 * 1024
-# Decoder row buffers can allocate from dimensions before consuming input.
-MAX_PDF_SCANLINE_COLUMNS = 32_768
-MAX_PDF_SCANLINE_BYTES = 256 * 1024
-# Conversions run in threads that cannot be killed: one that outlives its deadline keeps its slot
-# until it ends. With only 2 slots, two pathological PDFs stall every upload behind them (seen in
-# production on 2026-10-08 under the compact-cvs backfill). DOCUMENT_CONVERSION_WORKERS raises it.
+# Each conversion (pdfminer/markitdown) runs in its own child process, which is killed when it
+# outlives its deadline. These slots bound how many children run at once, and a slot is only
+# released after its child is dead. Before 2026-11-20 the conversion ran in a thread, which cannot
+# be killed: two stuck PDFs kept both slots and every upload answered 504 until the service was
+# restarted (2026-10-22 to 2026-11-19, and again 30 minutes after a restart).
+# Env: DOCUMENT_CONVERSION_WORKERS (default 2) and DOCUMENT_CONVERSION_TIMEOUT_SECONDS (default 120);
+# invalid values fall back to the default (see app/config.py). Each child holds the memory of one
+# pdfminer parse (tens to hundreds of MB), so raise the workers only with RAM to spare.
 DOCUMENT_CONVERSION_WORKERS = settings.document_conversion_workers
-DOCUMENT_CONVERSION_TIMEOUT_SECONDS = 120.0
-_DOCUMENT_BACKGROUND_WORKERS: set[asyncio.Task[str]] = set()
+DOCUMENT_CONVERSION_TIMEOUT_SECONDS = settings.document_conversion_timeout_seconds
 _DOCUMENT_CONVERSION_LIMITER = anyio.CapacityLimiter(DOCUMENT_CONVERSION_WORKERS)
+# The child imports app.document_conversion only: a light module that does not load app.config or
+# litellm, so a conversion starts in well under a second. Tests point this at a fake worker.
+_WORKER_COMMAND: list[str] = [sys.executable, "-m", "app.document_conversion"]
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+# After kill() the child is reaped (wait) so no zombie stays behind; this bounds that wait.
+_KILL_WAIT_SECONDS = 10.0
+_STDERR_TAIL_BYTES = 2000
 
 
-class DocumentValidationError(ValueError):
-    """Raised when uploaded bytes are not a structurally valid document."""
-
-
-class DocumentResourceLimitError(ValueError):
-    """Raised when a valid document exceeds a bounded processing budget."""
-
-
-_COMPOUND_FILE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
-
-
-class _PDFDecodeBudget:
-    """Track decoded PDF stream bytes across one parser instance."""
-
-    def __init__(self) -> None:
-        self.decoded_bytes = 0
-
-    @property
-    def remaining(self) -> int:
-        """Return the bytes available to the next decoded stream."""
-        return MAX_UNPACKED_DOCUMENT_BYTES - self.decoded_bytes
-
-    def consume(self, size: int) -> None:
-        """Charge one decoded stream to the document-wide limit."""
-        if size > self.remaining:
-            raise DocumentResourceLimitError(
-                "Document expanded content exceeds the 16MB limit."
-            )
-        self.decoded_bytes += size
-
-
-def _append_pdf_output(output: bytearray, chunk: bytes, limit: int) -> None:
-    """Append decoded stream bytes without crossing the remaining budget."""
-    if len(chunk) > limit - len(output):
-        raise DocumentResourceLimitError(
-            "Document expanded content exceeds the 16MB limit."
-        )
-    output.extend(chunk)
-
-
-def _decode_flate_bounded(data: bytes, limit: int) -> bytes:
-    """Incrementally inflate a stream while enforcing its remaining budget."""
-    decoder = zlib.decompressobj()
-    output = bytearray()
-    for offset in range(0, len(data), DOCUMENT_IO_CHUNK_SIZE):
-        pending = data[offset : offset + DOCUMENT_IO_CHUNK_SIZE]
-        while pending:
-            max_output = min(DOCUMENT_IO_CHUNK_SIZE, limit - len(output) + 1)
-            chunk = decoder.decompress(pending, max_output)
-            _append_pdf_output(output, chunk, limit)
-            pending = decoder.unconsumed_tail
-    _append_pdf_output(output, decoder.flush(limit - len(output) + 1), limit)
-    if not decoder.eof:
-        raise ValueError("Truncated FlateDecode stream")
-    return bytes(output)
-
-
-def _decode_lzw_bounded(data: bytes, limit: int) -> bytes:
-    """Decode an LZW stream one emitted code at a time under a byte limit."""
-    output = bytearray()
-    for chunk in LZWDecoder(io.BytesIO(data)).run():
-        _append_pdf_output(output, chunk, limit)
-    return bytes(output)
-
-
-def _decode_run_length_bounded(data: bytes, limit: int) -> bytes:
-    """Decode Adobe run-length data without first materializing all output."""
-    output = bytearray()
-    offset = 0
-    while offset < len(data):
-        length = data[offset]
-        offset += 1
-        if length == 128:
-            break
-        if length < 128:
-            end = offset + length + 1
-            if end > len(data):
-                raise ValueError("Truncated run-length literal")
-            _append_pdf_output(output, data[offset:end], limit)
-            offset = end
-            continue
-        if offset >= len(data):
-            raise ValueError("Truncated run-length repeat")
-        _append_pdf_output(output, bytes([data[offset]]) * (257 - length), limit)
-        offset += 1
-    return bytes(output)
-
-
-class _BoundedCCITTFaxDecoder(CCITTFaxDecoder):
-    """Collect CCITT rows only while they fit the current stream budget."""
-
-    def __init__(
-        self,
-        width: int,
-        *,
-        bytealign: bool,
-        reversed_bits: bool,
-        limit: int,
-    ) -> None:
-        super().__init__(width, bytealign=bytealign, reversed=reversed_bits)
-        self._chunks: list[bytes] = []
-        self._decoded_size = 0
-        self._limit = limit
-
-    def output_line(self, y: int, bits: Sequence[int]) -> None:
-        """Encode one decoded bitmap row after reserving its output bytes."""
-        row_size = (len(bits) + 7) // 8
-        if row_size > self._limit - self._decoded_size:
-            raise DocumentResourceLimitError(
-                "Document expanded content exceeds the 16MB limit."
-            )
-        row = array.array("B", [0] * row_size)
-        source_bits = [1 - bit for bit in bits] if self.reversed else bits
-        masks = (128, 64, 32, 16, 8, 4, 2, 1)
-        for index, bit in enumerate(source_bits):
-            if bit:
-                row[index // 8] += masks[index % 8]
-        encoded = row.tobytes()
-        self._chunks.append(encoded)
-        self._decoded_size += len(encoded)
-
-    def close(self) -> bytes:
-        """Join already bounded rows into the decoded stream."""
-        return b"".join(self._chunks)
-
-
-def _decode_ccitt_bounded(data: bytes, params: dict[str, Any], limit: int) -> bytes:
-    """Decode the CCITT variant supported by pdfminer with bounded output."""
-    if params.get("K") != -1:
-        raise ValueError("Unsupported CCITT encoding")
-    width = int_value(params.get("Columns"))
-    if width <= 0:
-        raise ValueError("CCITT stream has no positive column count")
-    if width > MAX_PDF_SCANLINE_COLUMNS or (width + 7) // 8 > limit:
-        raise DocumentResourceLimitError(
-            "Document expanded content exceeds the 16MB limit."
-        )
-    decoder = _BoundedCCITTFaxDecoder(
-        width,
-        bytealign=bool(params.get("EncodedByteAlign")),
-        reversed_bits=bool(params.get("BlackIs1")),
-        limit=limit,
-    )
-    decoder.feedbytes(data)
-    return decoder.close()
-
-
-def _apply_pdf_predictor(data: bytes, params: dict[str, Any]) -> bytes:
-    """Apply the same predictor transformations as pdfminer."""
-    predictor = int_value(params.get("Predictor", 1))
-    if predictor == 1:
-        return data
-    colors = int_value(params.get("Colors", 1))
-    columns = int_value(params.get("Columns", 1))
-    bits_per_component = int_value(params.get("BitsPerComponent", 8))
-    if colors <= 0 or columns <= 0 or bits_per_component <= 0:
-        raise ValueError("PDF predictor dimensions must be positive")
-    row_bytes = (colors * columns * bits_per_component + 7) // 8
-    if columns > MAX_PDF_SCANLINE_COLUMNS or row_bytes > MAX_PDF_SCANLINE_BYTES:
-        raise DocumentResourceLimitError(
-            "Document decoder row dimensions exceed the processing limit."
-        )
-    if predictor == 2:
-        return apply_tiff_predictor(colors, columns, bits_per_component, data)
-    if predictor >= 10:
-        return apply_png_predictor(predictor, colors, columns, bits_per_component, data)
-    raise ValueError("Unsupported PDF predictor")
-
-
-def _decode_pdf_stream(
-    data: bytes,
-    filters: list[tuple[Any, Any]],
-    limit: int,
-) -> bytes:
-    """Decode every PDF filter while bounding each expansion stage."""
-    for filter_name, raw_params in filters:
-        params = raw_params if isinstance(raw_params, dict) else {}
-        if filter_name in LITERALS_FLATE_DECODE:
-            data = _decode_flate_bounded(data, limit)
-        elif filter_name in LITERALS_LZW_DECODE:
-            data = _decode_lzw_bounded(data, limit)
-        elif filter_name in LITERALS_ASCII85_DECODE:
-            data = ascii85decode(data)
-        elif filter_name in LITERALS_ASCIIHEX_DECODE:
-            data = asciihexdecode(data)
-        elif filter_name in LITERALS_RUNLENGTH_DECODE:
-            data = _decode_run_length_bounded(data, limit)
-        elif filter_name in LITERALS_CCITTFAX_DECODE:
-            data = _decode_ccitt_bounded(data, params, limit)
-        elif (
-            filter_name in LITERALS_DCT_DECODE
-            or filter_name in LITERALS_JBIG2_DECODE
-            or filter_name in LITERALS_JPX_DECODE
-        ):
-            # pdfminer passes already compressed image formats through unchanged.
-            pass
-        elif filter_name == LITERAL_CRYPT:
-            raise ValueError("Encrypted PDF streams are not supported")
-        else:
-            raise ValueError("Unsupported PDF stream filter")
-
-        if len(data) > limit:
-            raise DocumentResourceLimitError(
-                "Document expanded content exceeds the 16MB limit."
-            )
-        if params and "Predictor" in params:
-            data = _apply_pdf_predictor(data, params)
-            if len(data) > limit:
-                raise DocumentResourceLimitError(
-                    "Document expanded content exceeds the 16MB limit."
-                )
-    return data
-
-
-class _BoundedPDFStream(PDFStream):
-    """PDF stream whose decoder charges a request-local shared budget."""
-
-    def __init__(self, stream: PDFStream, budget: _PDFDecodeBudget) -> None:
-        super().__init__(stream.attrs, stream.rawdata, stream.decipher)
-        self._budget = budget
-
-    def decode(self) -> None:
-        """Decode this stream with bounded filter implementations."""
-        if self.rawdata is None:
-            raise ValueError("PDF stream has no raw data")
-        data = self.rawdata
-        if self.decipher:
-            if self.objid is None or self.genno is None:
-                raise ValueError("Encrypted PDF stream is missing an object ID")
-            data = self.decipher(self.objid, self.genno, data, self.attrs)
-        decoded = _decode_pdf_stream(data, self.get_filters(), self._budget.remaining)
-        self._budget.consume(len(decoded))
-        self.data = decoded
-        self.rawdata = None
-
-
-class _BoundedPDFParser(PDFParser):
-    """Install bounded streams locally without patching pdfminer globals."""
-
-    def __init__(self, stream: BinaryIO, budget: _PDFDecodeBudget) -> None:
-        super().__init__(stream)
-        self._budget = budget
-
-    def do_keyword(self, pos: int, token: PSKeyword) -> None:
-        """Replace each newly parsed stream with its bounded counterpart."""
-        super().do_keyword(pos, token)
-        if token is self.KEYWORD_STREAM:
-            stream_pos, parsed = self.curstack[-1]
-            if isinstance(parsed, PDFStream):
-                self.curstack[-1] = (
-                    stream_pos,
-                    _BoundedPDFStream(parsed, self._budget),
-                )
-
-
-def _validate_pdf_container(path: Path) -> None:
-    """Require a readable PDF whose decoded streams fit a shared budget."""
-    try:
-        with path.open("rb") as stream:
-            budget = _PDFDecodeBudget()
-            document = PDFDocument(_BoundedPDFParser(stream, budget))
-            manager = PDFResourceManager(caching=False)
-            interpreter = PDFPageInterpreter(manager, PDFDevice(manager))
-            has_pages = False
-            for page in PDFPage.create_pages(document):
-                has_pages = True
-                # Follow the real text consumer's references under the same
-                # bounded stream decoder. A forged /Image label on a content
-                # or font stream cannot bypass preflight expansion limits.
-                interpreter.process_page(page)
-            if not has_pages:
-                raise ValueError("PDF has no pages")
-            seen: set[int] = set()
-            for xref in document.xrefs:
-                for object_id in xref.get_objids():
-                    if object_id in seen:
-                        continue
-                    seen.add(object_id)
-                    value = document.getobj(object_id)
-                    if isinstance(value, PDFStream):
-                        # Text extraction never decodes image XObjects. Their
-                        # optional codecs must not reject otherwise readable text.
-                        if literal_name(value.attrs.get("Subtype")) != "Image":
-                            value.get_data()
-    except DocumentResourceLimitError:
-        raise
-    except Exception as exc:
-        raise DocumentValidationError(
-            "The uploaded file is not a valid PDF, DOC, or DOCX document."
-        ) from exc
-
-
-def _validate_docx_container(path: Path) -> None:
-    """Require a bounded, readable Office Open XML word-processing package."""
-    try:
-        with zipfile.ZipFile(path) as archive:
-            members = archive.infolist()
-            if len(members) > MAX_DOCX_MEMBERS:
-                raise DocumentResourceLimitError(
-                    f"Document archive contains more than {MAX_DOCX_MEMBERS} entries."
-                )
-
-            names = {member.filename for member in members}
-            if "[Content_Types].xml" not in names or "word/document.xml" not in names:
-                raise DocumentValidationError(
-                    "The uploaded file is not a valid PDF, DOC, or DOCX document."
-                )
-
-            declared_size = 0
-            for member in members:
-                if member.flag_bits & 0x1:
-                    raise DocumentValidationError(
-                        "Encrypted PDF, DOC, or DOCX files are not supported."
-                    )
-                declared_size += member.file_size
-                if declared_size > MAX_UNPACKED_DOCUMENT_BYTES:
-                    raise DocumentResourceLimitError(
-                        "Document expanded content exceeds the 16MB limit."
-                    )
-
-            streamed_size = 0
-            for member in members:
-                if member.is_dir():
-                    continue
-                with archive.open(member) as source:
-                    while chunk := source.read(DOCUMENT_IO_CHUNK_SIZE):
-                        streamed_size += len(chunk)
-                        if streamed_size > MAX_UNPACKED_DOCUMENT_BYTES:
-                            raise DocumentResourceLimitError(
-                                "Document expanded content exceeds the 16MB limit."
-                            )
-    except DocumentResourceLimitError:
-        raise
-    except DocumentValidationError:
-        raise
-    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
-        raise DocumentValidationError(
-            "The uploaded file is not a valid PDF, DOC, or DOCX document."
-        ) from exc
-
-
-def _validate_doc_container(path: Path) -> None:
-    """Validate the fixed compound-file header used by legacy Word documents."""
-    try:
-        with path.open("rb") as stream:
-            header = stream.read(512)
-    except OSError as exc:
-        raise DocumentValidationError(
-            "The uploaded file is not a valid PDF, DOC, or DOCX document."
-        ) from exc
-
-    sector_shift = int.from_bytes(header[30:32], "little") if len(header) >= 32 else -1
-    mini_sector_shift = (
-        int.from_bytes(header[32:34], "little") if len(header) >= 34 else -1
-    )
-    if (
-        len(header) != 512
-        or header[:8] != _COMPOUND_FILE_SIGNATURE
-        or header[28:30] != b"\xfe\xff"
-        or sector_shift not in (9, 12)
-        or mini_sector_shift != 6
-        or header[34:40] != b"\x00" * 6
-    ):
-        raise DocumentValidationError(
-            "The uploaded file is not a valid PDF, DOC, or DOCX document."
-        )
-
-    major_version = int.from_bytes(header[26:28], "little")
-    file_size = path.stat().st_size
-    sector_size = 1 << sector_shift
-    sector_count = file_size // sector_size - 1
-    fat_sector_count = int.from_bytes(header[44:48], "little")
-    first_directory_sector = int.from_bytes(header[48:52], "little")
-    difat_entries = [
-        int.from_bytes(header[offset : offset + 4], "little")
-        for offset in range(76, 512, 4)
-    ]
-    inline_fat_sectors = [entry for entry in difat_entries if entry < 0xFFFFFFFA]
-    if (
-        major_version not in (3, 4)
-        or (major_version == 3 and sector_shift != 9)
-        or (major_version == 4 and sector_shift != 12)
-        or file_size < sector_size * 3
-        or file_size % sector_size != 0
-        or fat_sector_count < 1
-        or fat_sector_count > sector_count
-        or first_directory_sector >= sector_count
-        or len(inline_fat_sectors) < min(fat_sector_count, len(difat_entries))
-        or any(entry >= sector_count for entry in inline_fat_sectors)
-    ):
-        raise DocumentValidationError(
-            "The uploaded file is not a valid PDF, DOC, or DOCX document."
-        )
-
-
-def _validate_extracted_text(text: str) -> None:
-    """Bound prompt-bound UTF-8 text without allocating another full-size copy."""
-    extracted_bytes = 0
-    for offset in range(0, len(text), DOCUMENT_IO_CHUNK_SIZE):
-        chunk = text[offset : offset + DOCUMENT_IO_CHUNK_SIZE]
-        extracted_bytes += len(chunk.encode("utf-8"))
-        if extracted_bytes > MAX_EXTRACTED_TEXT_BYTES:
-            raise DocumentResourceLimitError(
-                "Document extracted text exceeds the 2MB processing limit."
-            )
+class DocumentConversionError(RuntimeError):
+    """The conversion process died or produced no usable result (crash, OOM kill)."""
 
 
 # Matches date ranges like "Jan 2020 - Dec 2023", "May 2021 - Present",
@@ -729,34 +313,6 @@ def has_meaningful_resume_content(resume_data: Any) -> bool:
     )
 
 
-def _parse_document_sync(content: bytes, filename: str) -> str:
-    """Validate and convert a document inside a bounded worker thread."""
-    suffix = Path(filename).suffix.lower()
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            tmp.write(content)
-        if suffix == ".pdf":
-            _validate_pdf_container(tmp_path)
-        elif suffix == ".doc":
-            _validate_doc_container(tmp_path)
-        elif suffix == ".docx":
-            _validate_docx_container(tmp_path)
-        md = MarkItDown()
-        result = md.convert(str(tmp_path))
-        text = result.text_content
-        if not isinstance(text, str):
-            raise DocumentValidationError(
-                "The uploaded file is not a valid PDF, DOC, or DOCX document."
-            )
-        _validate_extracted_text(text)
-        return text
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-
-
 def _validate_parsed_resume(result: dict[str, Any]) -> dict[str, Any]:
     """Validate that parsed output is a schema-valid, non-empty resume."""
     parsed_data = ResumeData.model_validate(result).model_dump()
@@ -765,8 +321,116 @@ def _validate_parsed_resume(result: dict[str, Any]) -> dict[str, Any]:
     return parsed_data
 
 
+def _safe_suffix(filename: str) -> str:
+    """The extension picks the container check and the markitdown converter in the child."""
+    suffix = Path(filename).suffix.lower()
+    return suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix) else ""
+
+
+def _stderr_tail(path: Path) -> str:
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - _STDERR_TAIL_BYTES))
+            return stream.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+    """Kill the child and wait for it, so no zombie or running process survives."""
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass  # already gone
+    try:
+        await asyncio.wait_for(asyncio.shield(process.wait()), _KILL_WAIT_SECONDS)
+    except TimeoutError:
+        logger.error(
+            "Document conversion process %s did not exit %.0fs after kill",
+            process.pid,
+            _KILL_WAIT_SECONDS,
+        )
+
+
+def _read_conversion_result(
+    returncode: int | None, result_path: Path, stderr_path: Path
+) -> str:
+    """Turn the finished child's result file into text, or the exception the file reports."""
+    if returncode != 0:
+        raise DocumentConversionError(
+            f"Document conversion process exited with code {returncode}: "
+            f"{_stderr_tail(stderr_path)}"
+        )
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        status = payload["status"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DocumentConversionError(
+            "Document conversion process left no readable result"
+        ) from exc
+    if status == "ok" and isinstance(payload.get("text"), str):
+        return payload["text"]
+    message = str(payload.get("message", ""))
+    kind = payload.get("kind")
+    if kind == "resource_limit":
+        raise DocumentResourceLimitError(message)
+    if kind == "validation":
+        raise DocumentValidationError(message)
+    raise DocumentConversionError(f"{payload.get('type', 'Error')}: {message}")
+
+
+async def _run_conversion_process(content: bytes, filename: str, timeout: float) -> str:
+    """Convert in a child process that is killed (and reaped) if it outlives ``timeout``.
+
+    The working directory holds the input, the child's JSON result and its stderr; it is removed
+    whatever happens (success, error, deadline, cancellation of the request).
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="rm-convert-"))
+    input_path = workdir / f"input{_safe_suffix(filename)}"
+    result_path = workdir / "result.json"
+    stderr_path = workdir / "stderr.log"
+    process: asyncio.subprocess.Process | None = None
+    try:
+        input_path.write_bytes(content)
+        with stderr_path.open("wb") as stderr:
+            process = await asyncio.create_subprocess_exec(
+                *_WORKER_COMMAND,
+                str(input_path),
+                str(result_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=stderr,
+                cwd=str(_BACKEND_ROOT),
+            )
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "Document conversion killed after exceeding its %.0fs deadline: "
+                "%s (%d bytes, pid %s)",
+                DOCUMENT_CONVERSION_TIMEOUT_SECONDS,
+                filename,
+                len(content),
+                process.pid,
+            )
+            raise
+        return _read_conversion_result(process.returncode, result_path, stderr_path)
+    finally:
+        try:
+            if process is not None and process.returncode is None:
+                await _kill_and_reap(process)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 async def parse_document(content: bytes, filename: str) -> str:
-    """Convert a bounded PDF/DOC/DOCX without blocking the request event loop.
+    """Convert a bounded PDF/DOC/DOCX to Markdown without blocking the request event loop.
+
+    The conversion runs in a child process (``python -m app.document_conversion``) so that one
+    that does not finish can be killed: the deadline (queue wait plus conversion) raises
+    ``TimeoutError`` after killing it, and its slot is free again for the next upload. Cancelling
+    the request kills it too.
 
     Args:
         content: Raw file bytes
@@ -774,61 +438,25 @@ async def parse_document(content: bytes, filename: str) -> str:
 
     Returns:
         Markdown text content
+
+    Raises:
+        TimeoutError: the deadline passed (in the queue or converting); the child was killed.
+        DocumentValidationError / DocumentResourceLimitError: the file is invalid / too big.
+        DocumentConversionError: the child died or the converter failed unexpectedly.
     """
-    deadline = asyncio.get_running_loop().time() + DOCUMENT_CONVERSION_TIMEOUT_SECONDS
+    loop = asyncio.get_running_loop()
+    timeout = DOCUMENT_CONVERSION_TIMEOUT_SECONDS
+    deadline = loop.time() + timeout
+    limiter = _DOCUMENT_CONVERSION_LIMITER
     borrower = object()
-    # Queued requests still belong to their caller. Only an admitted conversion
-    # can outlive cancellation; abandoned queues never retain file bytes or run.
-    await asyncio.wait_for(
-        _DOCUMENT_CONVERSION_LIMITER.acquire_on_behalf_of(borrower),
-        timeout=DOCUMENT_CONVERSION_TIMEOUT_SECONDS,
-    )
-
-    async def run_admitted_worker() -> str:
-        try:
-            return await anyio.to_thread.run_sync(
-                _parse_document_sync, content, filename, abandon_on_cancel=False
-            )
-        finally:
-            _DOCUMENT_CONVERSION_LIMITER.release_on_behalf_of(borrower)
-
-    worker = asyncio.create_task(run_admitted_worker())
+    # A queued request that is cancelled or times out never starts a process.
+    await asyncio.wait_for(limiter.acquire_on_behalf_of(borrower), timeout=timeout)
     try:
-        return await asyncio.wait_for(
-            asyncio.shield(worker),
-            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+        return await _run_conversion_process(
+            content, filename, max(0.0, deadline - loop.time())
         )
-    except (asyncio.CancelledError, TimeoutError):
-        # Threads cannot be killed safely. Return on the caller's deadline while
-        # the worker retains its limiter slot and owns its tempfile until done.
-        _DOCUMENT_BACKGROUND_WORKERS.add(worker)
-        started = deadline - DOCUMENT_CONVERSION_TIMEOUT_SECONDS
-        logger.warning(
-            "Document conversion still running past its deadline: %s (%d bytes); "
-            "%d of %d conversion slots held by overdue conversions",
-            filename,
-            len(content),
-            len(_DOCUMENT_BACKGROUND_WORKERS),
-            DOCUMENT_CONVERSION_WORKERS,
-        )
-
-        def consume_result(done: asyncio.Task[str]) -> None:
-            _DOCUMENT_BACKGROUND_WORKERS.discard(done)
-            logger.warning(
-                "Overdue document conversion released its slot after %.0fs: %s",
-                asyncio.get_running_loop().time() - started,
-                filename,
-            )
-            if not done.cancelled():
-                try:
-                    done.result()
-                except Exception:
-                    logger.exception(
-                        "Document conversion failed after request cancellation"
-                    )
-
-        worker.add_done_callback(consume_result)
-        raise
+    finally:
+        limiter.release_on_behalf_of(borrower)
 
 
 async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:

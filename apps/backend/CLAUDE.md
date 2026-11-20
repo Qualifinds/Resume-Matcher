@@ -34,7 +34,7 @@ Stack: FastAPI 0.128 · Python **3.13+** · Pydantic v2 / pydantic-settings · S
 - `enrichment.py` — `/enrichment/analyze/{id}`, `/enhance`, `/apply/{id}`, `/regenerate`, `/apply-regenerated/{id}`.
 
 ### Services
-- `parser.py` — `parse_document` (markitdown bytes→Markdown), `parse_resume_to_json` (LLM→`ResumeData`), `restore_dates_from_markdown` (re-inserts months the LLM drops).
+- `parser.py` — `parse_document` (bytes→Markdown in a **child process** `python -m app.document_conversion`, killed at `DOCUMENT_CONVERSION_TIMEOUT_SECONDS` (120) and limited to `DOCUMENT_CONVERSION_WORKERS` (2) at once; validators and markitdown live in the light module `app/document_conversion.py`, which must not import `app.config`/`app.llm`), `parse_resume_to_json` (LLM→`ResumeData`), `restore_dates_from_markdown` (re-inserts months the LLM drops).
 - `improver.py` (largest) — keyword extraction, **diff-based** improvement (`generate_resume_diffs` → `apply_diffs` with path allow/block-lists → `verify_diff_result`), skill-target planning (`generate_skill_target_plan`/`verify_skill_target_plan`), legacy full-output `improve_resume`, `calculate_resume_diff`. Sanitizes prompt-injection patterns in user input.
 - `refiner.py` — multi-pass polish: keyword injection (LLM), AI-phrase removal (local, via `refinement.py` blacklist), master-alignment validation. Driven by `RefinementConfig`.
 - `cover_letter.py` — `generate_cover_letter`, `generate_outreach_message`, `generate_resume_title`; resolves custom-vs-default feature prompts at runtime.
