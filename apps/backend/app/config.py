@@ -317,8 +317,31 @@ class Settings(BaseSettings):
     ocr_max_pages: int = Field(default=4, ge=1, le=10)
     ocr_min_chars: int = Field(default=200, ge=0)
     ocr_timeout_seconds: float = Field(default=75.0, ge=5, le=110)
-    # Document conversions (markitdown) allowed at once, process-wide; see app/services/parser.py
+    # Document conversions (markitdown) allowed at once, process-wide, and the deadline after which
+    # a conversion process is killed; see app/services/parser.py. Each conversion is a child
+    # process holding one pdfminer parse in memory. Invalid values fall back to the default.
     document_conversion_workers: int = Field(default=2, ge=1, le=32)
+    document_conversion_timeout_seconds: float = Field(default=120.0, ge=1, le=600)
+
+    @field_validator("document_conversion_workers", mode="before")
+    @classmethod
+    def default_invalid_conversion_workers(cls, v: Any) -> int:
+        """Fall back to 2 on blank, non-integer or out-of-range [1, 32] input."""
+        try:
+            workers = int(str(v).strip())
+        except (TypeError, ValueError):
+            return 2
+        return workers if 1 <= workers <= 32 else 2
+
+    @field_validator("document_conversion_timeout_seconds", mode="before")
+    @classmethod
+    def default_invalid_conversion_timeout(cls, v: Any) -> float:
+        """Fall back to 120s on blank, non-numeric, nan/inf or out-of-range [1, 600] input."""
+        try:
+            seconds = float(str(v).strip())
+        except (TypeError, ValueError):
+            return 120.0
+        return seconds if 1 <= seconds <= 600 else 120.0  # nan fails the comparison
 
     # Master resumes (career tracks) a deployment keeps at once; see app/database.py
     max_master_resumes: int = Field(default=5, ge=1, le=1000)

@@ -2,16 +2,14 @@
 
 import asyncio
 import io
-import threading
 import zipfile
 import zlib
-from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from docx import Document
 
+from app.document_conversion import convert_document_bytes
 from app.services.parser import DocumentResourceLimitError, parse_document
 
 
@@ -171,11 +169,11 @@ async def test_parse_document_rejects_pdf_over_decoded_stream_limit() -> None:
     document = _pdf_bytes(zlib.compress(expanded, level=9), flate=True)
     assert len(document) < 4 * 1024 * 1024
 
-    with patch("app.services.parser.MarkItDown.convert") as convert:
+    with patch("app.document_conversion.MarkItDown.convert") as convert:
         with pytest.raises(
             DocumentResourceLimitError, match="expanded content exceeds"
         ):
-            await parse_document(document, "expanded.pdf")
+            await asyncio.to_thread(convert_document_bytes, document, "expanded.pdf")
 
     convert.assert_not_called()
 
@@ -185,11 +183,13 @@ async def test_parse_document_bounds_pdf_xref_stream_during_initialization() -> 
     document = _xref_stream_pdf_bytes(decoded_padding=17 * 1024 * 1024)
     assert len(document) < 4 * 1024 * 1024
 
-    with patch("app.services.parser.MarkItDown.convert") as convert:
+    with patch("app.document_conversion.MarkItDown.convert") as convert:
         with pytest.raises(
             DocumentResourceLimitError, match="expanded content exceeds"
         ):
-            await parse_document(document, "expanded-xref.pdf")
+            await asyncio.to_thread(
+                convert_document_bytes, document, "expanded-xref.pdf"
+            )
 
     convert.assert_not_called()
 
@@ -200,11 +200,11 @@ async def test_parse_document_applies_one_budget_across_pdf_streams() -> None:
     document = _pdf_with_content_streams([stream, stream], filter_name=b"FlateDecode")
     assert len(document) < 4 * 1024 * 1024
 
-    with patch("app.services.parser.MarkItDown.convert") as convert:
+    with patch("app.document_conversion.MarkItDown.convert") as convert:
         with pytest.raises(
             DocumentResourceLimitError, match="expanded content exceeds"
         ):
-            await parse_document(document, "aggregate.pdf")
+            await asyncio.to_thread(convert_document_bytes, document, "aggregate.pdf")
 
     convert.assert_not_called()
 
@@ -215,11 +215,11 @@ async def test_parse_document_bounds_run_length_pdf_expansion() -> None:
     document = _pdf_with_content_streams([encoded], filter_name=b"RunLengthDecode")
     assert len(document) < 4 * 1024 * 1024
 
-    with patch("app.services.parser.MarkItDown.convert") as convert:
+    with patch("app.document_conversion.MarkItDown.convert") as convert:
         with pytest.raises(
             DocumentResourceLimitError, match="expanded content exceeds"
         ):
-            await parse_document(document, "run-length.pdf")
+            await asyncio.to_thread(convert_document_bytes, document, "run-length.pdf")
 
     convert.assert_not_called()
 
@@ -278,144 +278,14 @@ async def test_real_docx_conversion_keeps_event_loop_responsive() -> None:
     assert ticks >= 2
 
 
-async def test_document_conversion_uses_at_most_two_workers() -> None:
-    """A third conversion waits until one of the two worker slots is released."""
-    document = _docx_bytes("bounded worker test")
-    lock = threading.Lock()
-    release = threading.Event()
-    two_entered = threading.Event()
-    active = 0
-    maximum_active = 0
-
-    def slow_convert(_converter: object, _path: str) -> SimpleNamespace:
-        nonlocal active, maximum_active
-        with lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-            if active == 2:
-                two_entered.set()
-        assert release.wait(timeout=5)
-        with lock:
-            active -= 1
-        return SimpleNamespace(text_content="bounded worker test")
-
-    with patch("app.services.parser.MarkItDown.convert", new=slow_convert):
-        tasks = [
-            asyncio.create_task(parse_document(document, f"worker-{index}.docx"))
-            for index in range(3)
-        ]
-        assert await asyncio.to_thread(two_entered.wait, 5)
-        await asyncio.sleep(0.05)
-        assert maximum_active == 2
-        release.set()
-        assert (
-            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
-            == ["bounded worker test"] * 3
-        )
-
-
-async def test_cancellation_leaves_converter_owning_tempfile_cleanup(
-    tmp_path: Path,
-) -> None:
-    """Cancellation returns promptly; the worker still owns eventual cleanup."""
-    converter_dir = tmp_path / "converter"
-    converter_dir.mkdir()
-    document = _docx_bytes("cleanup test")
-    entered = threading.Event()
-    release = threading.Event()
-
-    def slow_convert(_converter: object, _path: str) -> SimpleNamespace:
-        entered.set()
-        assert release.wait(timeout=5)
-        return SimpleNamespace(text_content="cleanup test")
-
-    with (
-        patch("app.services.parser.tempfile.tempdir", str(converter_dir)),
-        patch("app.services.parser.MarkItDown.convert", new=slow_convert),
-    ):
-        task = asyncio.create_task(parse_document(document, "cancelled.docx"))
-        assert await asyncio.to_thread(entered.wait, 5)
-        assert list(converter_dir.iterdir())
-        task.cancel()
-        await asyncio.sleep(0)
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert list(converter_dir.iterdir())
-        release.set()
-        for _ in range(100):
-            if not list(converter_dir.iterdir()):
-                break
-            await asyncio.sleep(0.01)
-
-    assert list(converter_dir.iterdir()) == []
-
-
-async def test_cancellation_logs_late_converter_failure(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A worker failure after cancellation is logged without replacing cancellation."""
-    converter_dir = tmp_path / "converter"
-    converter_dir.mkdir()
-    document = _docx_bytes("late failure")
-    entered = threading.Event()
-    release = threading.Event()
-
-    def failing_convert(_converter: object, _path: str) -> SimpleNamespace:
-        entered.set()
-        assert release.wait(timeout=5)
-        raise RuntimeError("controlled late converter failure")
-
-    with (
-        caplog.at_level("ERROR", logger="app.services.parser"),
-        patch("app.services.parser.tempfile.tempdir", str(converter_dir)),
-        patch("app.services.parser.MarkItDown.convert", new=failing_convert),
-    ):
-        task = asyncio.create_task(parse_document(document, "cancelled-error.docx"))
-        assert await asyncio.to_thread(entered.wait, 5)
-        task.cancel()
-        await asyncio.sleep(0)
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        for _ in range(100):
-            if "controlled late converter failure" in caplog.text:
-                break
-            await asyncio.sleep(0.01)
-
-    assert list(converter_dir.iterdir()) == []
-    assert "Document conversion failed after request cancellation" in caplog.text
-    assert "controlled late converter failure" in caplog.text
-
-
-async def test_tempfile_cleanup_after_success_and_converter_error(
-    tmp_path: Path,
-) -> None:
-    """Worker tempfiles are removed on both normal and exceptional completion."""
-    converter_dir = tmp_path / "converter"
-    converter_dir.mkdir()
-    document = _docx_bytes("cleanup paths")
-    with patch("app.services.parser.tempfile.tempdir", str(converter_dir)):
-        assert await parse_document(document, "success.docx") == "cleanup paths"
-        assert list(converter_dir.iterdir()) == []
-
-        with patch(
-            "app.services.parser.MarkItDown.convert",
-            side_effect=RuntimeError("controlled converter error"),
-        ):
-            with pytest.raises(RuntimeError, match="controlled converter error"):
-                await parse_document(document, "error.docx")
-
-    assert list(converter_dir.iterdir()) == []
-
-
 @pytest.mark.parametrize("predictor", [2, 12])
 def test_pdf_predictor_rejects_huge_dimensions_before_decoder_allocation(
     predictor: int,
 ) -> None:
-    from app.services.parser import _apply_pdf_predictor
+    from app.document_conversion import _apply_pdf_predictor
 
     target = "apply_tiff_predictor" if predictor == 2 else "apply_png_predictor"
-    with patch(f"app.services.parser.{target}", return_value=b"") as decoder:
+    with patch(f"app.document_conversion.{target}", return_value=b"") as decoder:
         with pytest.raises(DocumentResourceLimitError):
             _apply_pdf_predictor(
                 b"\x00", {"Predictor": predictor, "Columns": 1_000_000_000}
@@ -424,9 +294,9 @@ def test_pdf_predictor_rejects_huge_dimensions_before_decoder_allocation(
 
 
 def test_pdf_fax_rejects_huge_bitmap_width_before_decoder_allocation() -> None:
-    from app.services.parser import _decode_ccitt_bounded
+    from app.document_conversion import _decode_ccitt_bounded
 
-    with patch("app.services.parser._BoundedCCITTFaxDecoder") as decoder:
+    with patch("app.document_conversion._BoundedCCITTFaxDecoder") as decoder:
         decoder.return_value.close.return_value = b""
         with pytest.raises(DocumentResourceLimitError):
             _decode_ccitt_bounded(
@@ -436,14 +306,14 @@ def test_pdf_fax_rejects_huge_bitmap_width_before_decoder_allocation() -> None:
 
 
 def test_truncated_flate_stream_is_rejected() -> None:
-    from app.services.parser import _decode_flate_bounded
+    from app.document_conversion import _decode_flate_bounded
 
     with pytest.raises(ValueError, match="Truncated"):
         _decode_flate_bounded(zlib.compress(b"resume text")[:-2], 1024)
 
 
 def test_lzw_stream_decodes_incrementally_with_limit() -> None:
-    from app.services.parser import _decode_lzw_bounded
+    from app.document_conversion import _decode_lzw_bounded
 
     codes = [256, *b"ABC", 257]
     bits = "".join(f"{code:09b}" for code in codes)
@@ -453,40 +323,6 @@ def test_lzw_stream_decodes_incrementally_with_limit() -> None:
     assert _decode_lzw_bounded(encoded, 3) == b"ABC"
     with pytest.raises(DocumentResourceLimitError):
         _decode_lzw_bounded(encoded, 2)
-
-
-async def test_conversion_deadline_does_not_wait_for_stuck_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.services import parser
-
-    monkeypatch.setattr(
-        parser, "DOCUMENT_CONVERSION_TIMEOUT_SECONDS", 0.02, raising=False
-    )
-    release = threading.Event()
-    entered = threading.Event()
-    cleaned = threading.Event()
-
-    def stuck_convert(content: bytes, filename: str) -> str:
-        entered.set()
-        try:
-            release.wait(2)
-            return "done"
-        finally:
-            cleaned.set()
-
-    monkeypatch.setattr(parser, "_parse_document_sync", stuck_convert)
-    task = asyncio.create_task(parser.parse_document(b"x", "test.pdf"))
-    assert await asyncio.to_thread(entered.wait, 1)
-    try:
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(asyncio.shield(task), 0.2)
-        assert task.done(), "conversion must own its deadline, not caller wait_for"
-        assert not cleaned.is_set()
-    finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-        assert await asyncio.to_thread(cleaned.wait, 1)
 
 
 async def test_unused_image_filter_does_not_reject_text_pdf() -> None:
@@ -504,85 +340,3 @@ async def test_image_subtype_cannot_hide_page_content_expansion() -> None:
     )
     with pytest.raises(DocumentResourceLimitError):
         await parse_document(document, "forged-image.pdf")
-
-
-async def test_cancelled_queued_conversion_never_starts_later(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.services import parser
-
-    entered = threading.Event()
-    release = threading.Event()
-    lock = threading.Lock()
-    calls = 0
-
-    def convert(content: bytes, filename: str) -> str:
-        nonlocal calls
-        with lock:
-            calls += 1
-            if calls == 2:
-                entered.set()
-        release.wait(2)
-        return "synthetic"
-
-    monkeypatch.setattr(parser, "_parse_document_sync", convert)
-    owners = [
-        asyncio.create_task(parser.parse_document(b"x", "one.pdf")) for _ in range(2)
-    ]
-    assert await asyncio.to_thread(entered.wait, 1)
-    queued = asyncio.create_task(parser.parse_document(b"x", "queued.pdf"))
-    await asyncio.sleep(0.01)
-    queued.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await queued
-    release.set()
-    await asyncio.gather(*owners)
-    await asyncio.sleep(0.05)
-    assert calls == 2
-
-
-def test_conversion_slots_follow_settings() -> None:
-    from app.config import settings
-    from app.services import parser
-
-    assert parser.DOCUMENT_CONVERSION_WORKERS == settings.document_conversion_workers
-    assert (
-        parser._DOCUMENT_CONVERSION_LIMITER.total_tokens
-        == settings.document_conversion_workers
-    )
-
-
-async def test_overdue_conversion_is_logged_with_its_file(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An overdue conversion keeps its slot; the log must say which file and how many are held."""
-    import logging
-
-    from app.services import parser
-
-    monkeypatch.setattr(
-        parser, "DOCUMENT_CONVERSION_TIMEOUT_SECONDS", 0.02, raising=False
-    )
-    release = threading.Event()
-    entered = threading.Event()
-
-    def stuck_convert(content: bytes, filename: str) -> str:
-        entered.set()
-        release.wait(2)
-        return "done"
-
-    monkeypatch.setattr(parser, "_parse_document_sync", stuck_convert)
-    caplog.set_level(logging.WARNING, logger="app.services.parser")
-    task = asyncio.create_task(parser.parse_document(b"x", "slow-cv.pdf"))
-    assert await asyncio.to_thread(entered.wait, 1)
-    try:
-        with pytest.raises(TimeoutError):
-            await task
-        assert "still running past its deadline: slow-cv.pdf" in caplog.text
-    finally:
-        release.set()
-        for _ in range(50):
-            if "released its slot" in caplog.text:
-                break
-            await asyncio.sleep(0.02)
-    assert "released its slot" in caplog.text
